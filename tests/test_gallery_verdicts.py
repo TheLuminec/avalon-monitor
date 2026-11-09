@@ -178,7 +178,7 @@ def test_tool_writes_json(tmp_path, agent, tunnel, host, live_hub):
                        capture_output=True, text=True, timeout=60, env=env)
     assert r.returncode == 0, r.stderr
     d = json.loads(out.read_text())
-    assert set(d) == {"project", "set", "slug", "exported_at", "verdicts"}
+    assert set(d) == {"project", "set", "slug", "exported_at", "verdicts", "added"}   # "added": drawn boxes (test_gallery_added)
     assert (d["project"], d["set"], d["slug"]) == (p, "synthetic/cup/a", SLUG)
     assert [(v["file"], v["box_id"], v["verdict"]) for v in d["verdicts"]] == [("a.png", "b2", "good")]
     assert set(d["verdicts"][0]) == {"file", "box_id", "verdict", "at", "by"}
@@ -291,7 +291,7 @@ def test_access_login_allowed(agent, tunnel):
 
 
 def test_broadcast_login_only():
-    """Gallery login: a login-only broadcast (gallery / gallery_verdict events name sets, files and reviewers) reaches
+    """Gallery login: a login-only broadcast (gallery / gallery_verdict / gallery_added events name sets, files and reviewers) reaches
     only sockets opened with an Access login; other events reach every socket."""
     class WS:
         def __init__(self, login):
@@ -308,7 +308,7 @@ def test_broadcast_login_only():
     asyncio.run(hub.broadcast({"type": "host"}))
     assert a.got == ["gallery_verdict", "host"] and t.got == ["host"] and bare.got == ["host"]
     src = (ROOT / "server" / "avalon_monitor" / "routes_gallery.py").read_text()
-    assert src.count("hub.broadcast(") == src.count("login_only=True)") == 3
+    assert src.count("hub.broadcast(") == src.count("login_only=True)") == 6   # push, delete, verdict, drawn box x3
 
 
 @needs_node

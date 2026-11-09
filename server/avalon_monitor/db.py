@@ -224,6 +224,25 @@ CREATE TABLE IF NOT EXISTS gallery_verdicts (
     UNIQUE (project, slug, file, box_id)
 );
 
+-- Boxes an operator drew by hand in a gallery's full-size view (the teacher model missed the object): owner-confirmed
+-- positives for training and the real test set. box_id is made by the hub ("u" + 8 hex), never a teacher id. Like
+-- verdicts they outlive re-pushes; readers only report those whose file is in the set's current index, the others stay
+-- stored; deleting the set removes them. bbox in image pixels from the top-left, clamped to the image.
+CREATE TABLE IF NOT EXISTS gallery_added_boxes (
+    project TEXT NOT NULL,
+    slug    TEXT NOT NULL,
+    file    TEXT NOT NULL,
+    box_id  TEXT NOT NULL,
+    label   TEXT NOT NULL,
+    x       REAL NOT NULL,
+    y       REAL NOT NULL,
+    w       REAL NOT NULL,
+    h       REAL NOT NULL,
+    at      REAL NOT NULL,
+    by      TEXT,
+    UNIQUE (project, slug, file, box_id)
+);
+
 -- Per-user dashboard preferences (layout, hidden panels, card order).
 CREATE TABLE IF NOT EXISTS prefs (
     user    TEXT PRIMARY KEY,
@@ -1134,6 +1153,56 @@ class Database:
     def verdicts_delete_set(self, project: str, slug: str) -> int:
         with self._lock:
             return self._conn.execute("DELETE FROM gallery_verdicts WHERE project=? AND slug=?", (project, slug)).rowcount
+
+    # ---------------------------------------------------------------- gallery drawn boxes
+    @staticmethod
+    def _added(r: sqlite3.Row) -> dict:
+        return {"file": r["file"], "box_id": r["box_id"], "label": r["label"], "bbox": [r["x"], r["y"], r["w"], r["h"]],
+                "at": r["at"], "by": r["by"]}
+
+    def added_list(self, project: str, slug: str) -> list[dict]:
+        """Every drawn box of a set (orphans included: the caller filters by the current index)."""
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM gallery_added_boxes WHERE project=? AND slug=? ORDER BY file, at, box_id",
+                                      (project, slug)).fetchall()
+        return [self._added(r) for r in rows]
+
+    def added_get(self, project: str, slug: str, box_id: str) -> Optional[dict]:
+        """One drawn box by its id (ids are unique within a set: the hub makes them)."""
+        with self._lock:
+            r = self._conn.execute("SELECT * FROM gallery_added_boxes WHERE project=? AND slug=? AND box_id=?",
+                                   (project, slug, box_id)).fetchone()
+        return self._added(r) if r else None
+
+    def added_insert(self, project: str, slug: str, file: str, box_id: str, label: str, bbox: list, by: Optional[str],
+                     now: float | None = None) -> Optional[dict]:
+        """Store a new drawn box; None when that box_id is already taken in this set (the caller makes another)."""
+        at = time.time() if now is None else now
+        with self._lock:
+            if self._conn.execute("SELECT 1 FROM gallery_added_boxes WHERE project=? AND slug=? AND box_id=?",
+                                  (project, slug, box_id)).fetchone():
+                return None
+            self._conn.execute("INSERT INTO gallery_added_boxes(project, slug, file, box_id, label, x, y, w, h, at, by)"
+                               " VALUES (?,?,?,?,?,?,?,?,?,?,?)", (project, slug, file, box_id, label, *bbox, at, by))
+        return {"file": file, "box_id": box_id, "label": label, "bbox": list(bbox), "at": at, "by": by}
+
+    def added_update(self, project: str, slug: str, box_id: str, label: str, bbox: list, by: Optional[str],
+                     now: float | None = None) -> Optional[dict]:
+        """Relabel and/or move a drawn box (the caller passes the merged label and bbox). None if there is no such box."""
+        at = time.time() if now is None else now
+        with self._lock:
+            n = self._conn.execute("UPDATE gallery_added_boxes SET label=?, x=?, y=?, w=?, h=?, at=?, by=?"
+                                   " WHERE project=? AND slug=? AND box_id=?", (label, *bbox, at, by, project, slug, box_id)).rowcount
+        return self.added_get(project, slug, box_id) if n else None
+
+    def added_delete(self, project: str, slug: str, box_id: str) -> bool:
+        with self._lock:
+            return self._conn.execute("DELETE FROM gallery_added_boxes WHERE project=? AND slug=? AND box_id=?",
+                                      (project, slug, box_id)).rowcount > 0
+
+    def added_delete_set(self, project: str, slug: str) -> int:
+        with self._lock:
+            return self._conn.execute("DELETE FROM gallery_added_boxes WHERE project=? AND slug=?", (project, slug)).rowcount
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

@@ -267,7 +267,7 @@ def test_ui_js():
     src = (STATIC / "research.js").read_text()
     assert 'class: "gal-ovl", viewBox: `0 0 ${W} ${H}`' in src
     assert 'type: "range", min: "0", max: "1"' in src
-    assert "boxOverlay(it, f.thr, colorOf, false, vOf)" in src and "IntersectionObserver" in src and "CHUNK = 120" in src
+    assert "boxOverlay(it, f.thr, colorOf, false, vOf, addedOf(it.file))" in src and "IntersectionObserver" in src and "CHUNK = 120" in src
     assert 'e.key === "Escape"' in src and 'e.key === "ArrowLeft"' in src and "guard(h(\"button\"" in src
     js = """
 import { filterItems, boxesAbove, galleryUrl, NO_BOX } from %s;

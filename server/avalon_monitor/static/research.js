@@ -510,6 +510,10 @@ function dotbarFigure(fig, colors) {
 // Per-box review: a box with an "id" can be marked by an operator, in the grid and in the full-size view: left-click
 // inside a box = good, right-click = bad; the same click again clears it, the other one flips it. The smallest drawn
 // box under the pointer is the one meant. Reviewed boxes are always drawn (green ✓ / red ✗), whatever the slider says.
+// Drawn boxes: the teacher misses objects, so an operator can add a box by hand in the full-size view ("Draw box" or D,
+// then drag on the image; a label from the set's, or a new one). They come from .../added (not the index), carry a
+// hub-made box_id (never an `id`, so the good/bad hit-test never picks one), have no score and are always drawn: solid,
+// with a dark outline and "✎" before the label. The box list gives them their own rows (relabel, delete).
 const CHUNK = 120;
 const encPath = (f) => String(f).split("/").map(encodeURIComponent).join("/");
 export const galleryUrl = (project, slug, kind, file) => `/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(slug)}/${kind}/${encPath(file)}`;
@@ -518,9 +522,12 @@ const keptOf = (item) => (item?.tags && typeof item.tags.kept === "boolean" ? it
 const fScore = (v) => (num(v) == null ? "—" : v.toFixed(2));
 const bboxOf = (b) => (Array.isArray(b?.bbox) && b.bbox.length === 4 && b.bbox.every((v) => num(v) != null) ? b.bbox : null);
 const noVerdict = () => null;
+const noAdded = () => [];
 export const NO_BOX = Symbol("no box");   // never a label (a label can be any string)
 export const signedIn = () => state.config?.user?.method === "access";
 export const VERDICT_MARK = { good: "✓", bad: "✗" };
+export const DRAWN_MARK = "✎";
+export const MIN_DRAG_PX = 4;   // a smaller drag (either side, in image pixels) is a slip, not a box
 
 /** The key of one box's verdict (file names have no control characters, so "\n" can't occur in one). */
 export const vKey = (file, id) => `${file}\n${id}`;
@@ -535,12 +542,33 @@ export function drawnBoxes(item, thr, vOf = noVerdict) {
 }
 
 /** A client point -> image pixel space, from the overlay's on-screen rect and its "xMidYMid meet" scale (the image
- *  is letterboxed inside the rect). null outside the image itself. */
-export function toImagePx(rect, W, H, clientX, clientY) {
+ *  is letterboxed inside the rect). null outside the image itself, or with `clamp` the nearest point on it (a drag
+ *  that ends outside the image). */
+export function toImagePx(rect, W, H, clientX, clientY, clamp = false) {
   const k = Math.min(rect.width / W, rect.height / H);
   if (!(k > 0)) return null;
   const x = (clientX - rect.left - (rect.width - W * k) / 2) / k, y = (clientY - rect.top - (rect.height - H * k) / 2) / k;
+  if (clamp) return [Math.min(Math.max(x, 0), W), Math.min(Math.max(y, 0), H)];
   return x >= 0 && y >= 0 && x <= W && y <= H ? [x, y] : null;
+}
+
+/** A drag from image point p0 to p1 (either way round) -> [x, y, w, h] clamped to the W x H image and rounded to
+ *  0.1 px; null when either side is under `min` px (a click or a slip, not a box) or a point is missing. */
+export function dragToBox(p0, p1, W, H, min = MIN_DRAG_PX) {
+  if (!Array.isArray(p0) || !Array.isArray(p1) || ![...p0, ...p1, W, H].every((v) => num(v) != null)) return null;
+  const cx = (v) => Math.min(Math.max(v, 0), W), cy = (v) => Math.min(Math.max(v, 0), H);
+  const x0 = Math.min(cx(p0[0]), cx(p1[0])), x1 = Math.max(cx(p0[0]), cx(p1[0]));
+  const y0 = Math.min(cy(p0[1]), cy(p1[1])), y1 = Math.max(cy(p0[1]), cy(p1[1]));
+  if (x1 - x0 < min || y1 - y0 < min) return null;
+  const r = (v) => Math.round(v * 10) / 10;
+  return [r(x0), r(y0), r(x1 - x0), r(y1 - y0)];
+}
+
+/** The labels a drawn box can take in the editor: the set's own (index.labels), then any new ones already drawn. */
+export function drawLabels(index, added = []) {
+  const out = (Array.isArray(index?.labels) ? index.labels : []).filter((l) => typeof l === "string" && l);
+  for (const a of added) if (typeof a?.label === "string" && a.label && !out.includes(a.label)) out.push(a.label);
+  return out;
 }
 
 /** The smallest box (by area) containing image point (x, y), among `boxes` that have an id; null if none. */
@@ -574,11 +602,12 @@ export function reviewCounts(items, vOf = noVerdict) {
 
 /** Items passing the filters: label ("" any, NO_BOX = no box at/above the threshold, else a box with that label
  *  at/above it), session ("" any), kept ("" any, "kept", "dropped"; from tags.kept), review ("" any, "unreviewed" =
- *  a box with an id has no verdict, "bad" = a box marked bad, "done" = has boxes with ids and all are reviewed;
- *  verdicts from f.vOf). */
+ *  a box with an id has no verdict, "bad" = a box marked bad, "done" = has boxes with ids and all are reviewed,
+ *  "drawn" = has boxes drawn by hand; verdicts from f.vOf, drawn boxes from f.addedOf(file)). */
 export function filterItems(items, f) {
-  const vOf = f.vOf || noVerdict;
+  const vOf = f.vOf || noVerdict, addedOf = f.addedOf || noAdded;
   return items.filter((it) => {
+    if (f.review === "drawn" && !addedOf(it.file).length) return false;
     if (f.session !== "" && String(it.session ?? "") !== f.session) return false;
     if (f.kept === "kept" && keptOf(it) !== true) return false;
     if (f.kept === "dropped" && keptOf(it) !== false) return false;
@@ -586,7 +615,7 @@ export function filterItems(items, f) {
       const r = reviewOf(it, vOf);
       if (f.review === "unreviewed" && r.reviewed >= r.n) return false;
       if (f.review === "bad" && !r.bad) return false;
-      if (f.review === "done" && (!r.n || r.reviewed < r.n)) return false;
+      if (f.review === "done" && (!r.n || r.reviewed < r.n)) return false;   // ("drawn" was checked above)
     }
     if (f.label === "" || f.label == null) return true;
     const above = boxesAbove(it, f.thr);
@@ -596,8 +625,10 @@ export function filterItems(items, f) {
 
 /** One item's boxes as an SVG in the image's own pixel space (viewBox = width x height, top-left origin), laid over
  *  the image and scaled with it; boxes scoring below `thr` are left out unless reviewed (drawnBoxes). A reviewed box
- *  is green with ✓ (good) or red with ✗ (bad): colour and mark, never colour alone. `big` = the full-size view. */
-export function boxOverlay(item, thr, colorOf, big = false, vOf = noVerdict) {
+ *  is green with ✓ (good) or red with ✗ (bad): colour and mark, never colour alone. `big` = the full-size view.
+ *  `added`: the item's drawn boxes ({box_id, label, bbox}), all of them whatever `thr` (they have no score), drawn
+ *  solid over a dark outline in the label's colour with ✎ before the label. */
+export function boxOverlay(item, thr, colorOf, big = false, vOf = noVerdict, added = []) {
   const W = item.width, H = item.height;
   const g = s("svg", { class: "gal-ovl", viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "xMidYMid meet", "aria-hidden": "true" });
   const fs = Math.max(W, H) / (big ? 40 : 16);
@@ -615,32 +646,56 @@ export function boxOverlay(item, thr, colorOf, big = false, vOf = noVerdict) {
     g.append(s("text", { x: right ? Math.min(W, x + w) - fs * 0.15 : x + fs * 0.15, y: ty, "text-anchor": right ? "end" : null,
       class: "gal-lab", style: `--bc:${col};font-size:${fs}px` }, text));
   }
+  for (const a of added) {   // drawn by hand: never filtered by the slider
+    const bb = bboxOf(a);
+    if (!bb) continue;
+    const [x, y, w, bh] = bb, col = colorOf(a.label);
+    g.append(s("rect", { x, y, width: Math.max(0, w), height: Math.max(0, bh), class: "gal-drawn-halo" }),
+      s("rect", { x, y, width: Math.max(0, w), height: Math.max(0, bh), class: "gal-box gal-drawn", style: `--bc:${col}`, "data-bid": a.box_id }));
+    const text = `${DRAWN_MARK} ${a.label}`;
+    const ty = y > fs * 1.2 ? y - fs * 0.3 : y + fs;
+    const right = x + text.length * fs * 0.62 > W;
+    g.append(s("text", { x: right ? Math.min(W, x + w) - fs * 0.15 : x + fs * 0.15, y: ty, "text-anchor": right ? "end" : null,
+      class: "gal-lab gal-drawn-lab", style: `--bc:${col};font-size:${fs}px` }, text));
+  }
   return g;
 }
 
-// Full-size view of list[start]: the image with its boxes and every detail. Esc closes, arrow keys step.
+// Full-size view of list[start]: the image with its boxes and every detail. Esc closes, arrow keys step, D toggles
+// draw mode (operators). In draw mode a drag on the image draws a box (click/right-click review is suspended); on
+// release an inline editor beside the image asks for its label. While that editor is open (or a drag is under way)
+// Esc cancels the pending box only, never the view, Enter saves, and the arrow / D keys are left to the editor.
 function galleryModal(ctx, list, start) {
-  let i = start, fig = null, boxesEl = null;
+  let i = start, fig = null, boxesEl = null, edSlot = null, drawBtn = null;
+  let drag = null, edit = null, justDrew = 0;   // drag: {p0, id}; edit: the pending box's editor ({save, cancel})
   const body = h("div", { class: "gal-modal-body" });
   const close = () => { document.removeEventListener("keydown", onKey); ctx.listeners.delete(paint); wrap.remove(); };
   const go = (d) => { if (list.length) { i = (i + d + list.length) % list.length; draw(); } };
+  const typing = (t) => !!t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || "");
   const onKey = (e) => {
+    if (edit || drag) {   // a pending drawn box owns Esc / Enter; Esc must not close the view while editing
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancelPending(); }
+      else if (e.key === "Enter" && edit) { e.preventDefault(); if (e.target?.classList?.contains("gal-ed-cancel")) cancelPending(); else edit.save(); }
+      return;
+    }
     if (e.key === "Escape") { e.preventDefault(); close(); }
     else if (e.key === "ArrowLeft") { e.preventDefault(); go(-1); }
     else if (e.key === "ArrowRight") { e.preventDefault(); go(1); }
+    else if ((e.key === "d" || e.key === "D") && !e.ctrlKey && !e.metaKey && !e.altKey && !typing(e.target) && canChange()) { e.preventDefault(); toggleDraw(); }
   };
   const row = (k, v) => h("tr", {}, h("th", {}, k), h("td", {}, v == null || v === "" ? "—" : String(v)));
   const KNOWN = ["file", "width", "height", "text", "seed", "session", "tags", "boxes", "_i", "_vrev"];
-  function paint() {   // the overlay and the box table: redrawn on every verdict change, the image is kept
-    const it = list[i], thr = ctx.thr();
+  const fmtBox = (bb) => (Array.isArray(bb) ? bb.map((x) => (num(x) == null ? "?" : +x.toFixed(1))).join(", ") : "—");
+  function paint() {   // the overlay and the box table: redrawn on every verdict / drawn-box change, the image is kept
+    const it = list[i], thr = ctx.thr(), added = ctx.addedOf(it.file);
     fig.querySelector(".gal-ovl")?.remove();
-    fig.append(boxOverlay(it, thr, ctx.colorOf, true, ctx.vOf));
+    fig.append(boxOverlay(it, thr, ctx.colorOf, true, ctx.vOf, added));
     const boxes = (it.boxes || []).slice().sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
     const r = reviewOf(it, ctx.vOf);
     boxesEl.replaceChildren(
-      h("h4", {}, `Boxes (${boxes.length}; dimmed = below ${thr.toFixed(2)}${r.n ? `; reviewed ${r.reviewed} / ${r.n}` : ""})`),
-      boxes.length ? h("table", { class: "gal-kv gal-boxes" },
-        h("thead", {}, h("tr", {}, h("th", {}, "label"), h("th", { class: "r" }, "score"), h("th", {}, "bbox [x, y, w, h]"), h("th", {}, "review"))),
+      h("h4", {}, `Boxes (${boxes.length}${added.length ? ` + ${added.length} drawn` : ""}; dimmed = below ${thr.toFixed(2)}${r.n ? `; reviewed ${r.reviewed} / ${r.n}` : ""})`),
+      boxes.length || added.length ? h("table", { class: "gal-kv gal-boxes" },
+        h("thead", {}, h("tr", {}, h("th", {}, "label"), h("th", { class: "r" }, "score"), h("th", {}, "bbox [x, y, w, h]"), h("th", {}, "source"), h("th", {}, "review"))),
         h("tbody", {}, boxes.map((b) => {
           const v = typeof b.id === "string" ? ctx.vOf(it.file, b.id) : null;
           const id = typeof b.id === "string" ? b.id : null;
@@ -648,13 +703,20 @@ function galleryModal(ctx, list, start) {
             onmouseenter: id ? () => highlight(id, true) : null, onmouseleave: id ? () => highlight(id, false) : null },
             h("td", {}, h("i", { class: "lg-sw", style: `background:${ctx.colorOf(b.label)}` }), " ", b.label),
             h("td", { class: "r num" }, fScore(b.score)),
-            h("td", { class: "num" }, Array.isArray(b.bbox) ? b.bbox.map((x) => (num(x) == null ? "?" : +x.toFixed(1))).join(", ") : "—"),
+            h("td", { class: "num" }, fmtBox(b.bbox)),
+            h("td", { class: "muted" }, "model"),
             reviewCell(it, b, v));
-        })))
+        }), added.map((a) => h("tr", { class: "gal-drawn-row", onmouseenter: () => highlight(a.box_id, true), onmouseleave: () => highlight(a.box_id, false) },
+          h("td", {}, h("i", { class: "lg-sw", style: `background:${ctx.colorOf(a.label)}` }), " ", `${DRAWN_MARK} ${a.label}`),
+          h("td", { class: "r num muted" }, "—"),
+          h("td", { class: "num" }, fmtBox(a.bbox)),
+          h("td", { title: a.by ? `drawn by ${a.by}` : "drawn by hand" }, "drawn"),
+          addedCell(it, a)))))
         : h("div", { class: "muted" }, "no boxes"),
       r.n ? h("div", { class: "muted gal-hint" }, canChange()
         ? "Click inside a box: good · right-click: bad · the same click again clears it. Boxes hidden under others: use the ✓ / ✗ buttons in this list."
-        : "Sign in to review boxes.") : null);
+        : "Sign in to review boxes.") : null,
+      canChange() ? h("div", { class: "muted gal-hint" }, "Missed an object? Draw box (D), then drag on the image; pick its label and Save (Enter) or Cancel (Esc).") : null);
   }
   // The review cell of one box row. Operators get ✓ good / ✗ bad buttons, so every box can be reviewed, including one
   // whose area is covered by a smaller box (the image click picks the smallest box under the pointer). Hovering the row
@@ -669,16 +731,124 @@ function galleryModal(ctx, list, start) {
       onclick: (e) => { e.stopPropagation(); ctx.setVerdict(it, id, nextVerdict(v, which)); } }, label);
     return h("td", { class: "gal-vcell", title: `box id ${id}` }, btn("good", `${VERDICT_MARK.good} good`), " ", btn("bad", `${VERDICT_MARK.bad} bad`));
   }
+  // A drawn box's cell: operators re-label it (a small select; "other…" opens the editor) or delete it. A box whose
+  // POST is still in flight has no hub id yet, so it can't be changed until it lands.
+  function addedCell(it, a) {
+    if (!canChange()) return h("td", { class: "muted", title: `box id ${a.box_id}` }, a.by ? `by ${a.by}` : "—");
+    const saved = !a._tmp;
+    const labels = ctx.labels();
+    if (!labels.includes(a.label)) labels.push(a.label);
+    const sel = h("select", { class: "gal-relabel", "aria-label": "label of this drawn box", title: "re-label", disabled: saved ? null : "" },
+      ...labels.map((l, k) => h("option", { value: String(k), selected: l === a.label ? "" : null }, l)), h("option", { value: "other" }, "other…"));
+    sel.addEventListener("change", () => {
+      if (sel.value === "other") { openEditor(it, a.bbox, a); return; }
+      const l = labels[Number(sel.value)];
+      if (l != null && l !== a.label) ctx.editAdded(it, a, { label: l });
+    });
+    const del = h("button", { class: "btn small danger gal-del-drawn", title: "delete this drawn box", disabled: saved ? null : "",
+      onclick: (e) => { e.stopPropagation(); ctx.deleteAdded(it, a); } }, "delete");
+    return h("td", { class: "gal-vcell", title: `box id ${a.box_id}` }, sel, " ", del);
+  }
   function highlight(id, on) {   // the box list's row hover: outline that box on the image (if it is drawn)
     for (const el of fig?.querySelectorAll(".gal-ovl .gal-box") || []) el.classList.toggle("gal-hl", on && el.getAttribute("data-bid") === id);
   }
+
+  // ---- drawing: drag on the image (image pixel space via toImagePx, clamped when the pointer leaves the image)
+  function pendLayer() {   // the pending box's own layer (paint() only replaces .gal-ovl)
+    const it = list[i];
+    return fig.querySelector(".gal-pend") || fig.appendChild(s("svg", { class: "gal-pend", viewBox: `0 0 ${it.width} ${it.height}`, preserveAspectRatio: "xMidYMid meet", "aria-hidden": "true" }));
+  }
+  function showPending(bb) {
+    const layer = pendLayer();
+    const r = layer.querySelector("rect") || layer.appendChild(s("rect", { class: "gal-pend-box" }));
+    const [x, y, w, bh] = bb;
+    for (const [k, v] of Object.entries({ x, y, width: w, height: bh })) r.setAttribute(k, v);
+  }
+  function cancelPending() {   // drops the drag / the editor's box only; the view and draw mode stay
+    const relabel = !!edit?.row;
+    drag = null; edit = null;
+    fig?.querySelector(".gal-pend")?.remove();
+    edSlot?.replaceChildren();
+    if (relabel) paint();   // the row's select still says "other…"
+  }
+  function toggleDraw(on = !ctx.draw.on) {
+    if (!canChange()) return;
+    ctx.draw.on = on;
+    if (!on) cancelPending();
+    fig?.classList.toggle("gal-drawing", on);
+    if (drawBtn) { drawBtn.classList.toggle("active", on); drawBtn.setAttribute("aria-pressed", on ? "true" : "false"); }
+  }
+  const imgPx = (e, clamp) => {
+    const it = list[i], svg = fig.querySelector(".gal-ovl");
+    return svg && toImagePx(svg.getBoundingClientRect(), it.width, it.height, e.clientX, e.clientY, clamp);
+  };
+  function onDown(e) {
+    if (!ctx.draw.on || edit || drag || e.button !== 0 || !canChange()) return;
+    const p0 = imgPx(e, false);
+    if (!p0) return;   // a drag starts on the image itself
+    e.preventDefault();
+    try { fig.setPointerCapture(e.pointerId); } catch { /* without capture, moves outside the image still clamp */ }
+    drag = { p0, id: e.pointerId };
+  }
+  function onMove(e) {
+    if (!drag || e.pointerId !== drag.id) return;
+    const it = list[i], bb = dragToBox(drag.p0, imgPx(e, true), it.width, it.height, 0);
+    if (bb) showPending(bb);
+  }
+  function onUp(e) {
+    if (!drag || e.pointerId !== drag.id) return;
+    const it = list[i], bb = dragToBox(drag.p0, imgPx(e, true), it.width, it.height);
+    drag = null; justDrew = Date.now();
+    if (!bb) { cancelPending(); return; }   // a click or a tiny slip: no box
+    showPending(bb);
+    openEditor(it, bb, null);
+  }
+
+  // ---- the inline editor (beside the image, never a browser prompt): label select + "other…" text, Save / Cancel
+  function openEditor(it, bbox, row) {   // row: re-label that drawn box; null: a new box at bbox
+    const labels = ctx.labels();
+    const startLabel = row ? row.label : ctx.draw.last ?? labels[0] ?? "";
+    const custom = !labels.includes(startLabel);
+    const sel = h("select", { class: "gal-ed-sel", "aria-label": "label of the drawn box" },
+      ...labels.map((l, k) => h("option", { value: String(k), selected: !custom && l === startLabel ? "" : null }, l)),
+      h("option", { value: "other", selected: custom ? "" : null }, "other…"));
+    const txt = h("input", { type: "text", class: "gal-ed-txt", maxlength: "40", placeholder: "new label", "aria-label": "new label", value: custom ? startLabel : "" });
+    const syncTxt = () => { txt.hidden = sel.value !== "other"; };
+    sel.addEventListener("change", () => { syncTxt(); if (!txt.hidden) txt.focus(); });
+    syncTxt();
+    const save = () => {
+      const label = sel.value === "other" ? txt.value.trim() : labels[Number(sel.value)];
+      if (!label || label.length > 40) { txt.hidden = false; txt.classList.add("bad"); txt.focus(); return; }
+      ctx.draw.last = label;
+      cancelPending();
+      if (row) { if (label !== row.label) ctx.editAdded(it, row, { label }); }
+      else ctx.addAdded(it, label, bbox);
+    };
+    edit = { save, cancel: cancelPending, row };
+    edSlot.replaceChildren(h("div", { class: "gal-ed", role: "group", "aria-label": row ? "re-label the drawn box" : "label the new box" },
+      h("span", { class: "gal-ed-what" }, `${DRAWN_MARK} ${row ? "re-label" : "new box"} ${fmtBox(bbox)}`),
+      sel, txt,
+      h("button", { class: "btn small primary gal-ed-save", onclick: save, title: "save (Enter)" }, "Save"),
+      h("button", { class: "btn small gal-ed-cancel", onclick: cancelPending, title: "cancel (Esc)" }, "Cancel")));
+    (txt.hidden ? sel : txt).focus();
+  }
+
   function draw() {
     const it = list[i];
-    fig = h("div", { class: "gal-full", style: `aspect-ratio:${it.width} / ${it.height}` },
-      h("img", { src: galleryUrl(ctx.project, ctx.slug(), "image", it.file), alt: it.file, decoding: "async" }));
-    fig.addEventListener("click", (e) => ctx.review(e, it, fig, "good", true));
-    fig.addEventListener("contextmenu", (e) => ctx.review(e, it, fig, "bad", true));
+    drag = null; edit = null;   // a pending box belongs to the image it was drawn on
+    fig = h("div", { class: "gal-full" + (ctx.draw.on && canChange() ? " gal-drawing" : ""), style: `aspect-ratio:${it.width} / ${it.height}` },
+      h("img", { src: galleryUrl(ctx.project, ctx.slug(), "image", it.file), alt: it.file, decoding: "async", draggable: "false" }));
+    // review clicks are suspended while drawing (the click that ends a drag must not mark a box)
+    fig.addEventListener("click", (e) => { if (ctx.draw.on || edit) { e.preventDefault(); return; } ctx.review(e, it, fig, "good", true); });
+    fig.addEventListener("contextmenu", (e) => { if (ctx.draw.on || edit) { e.preventDefault(); return; } ctx.review(e, it, fig, "bad", true); });
+    fig.addEventListener("pointerdown", onDown);
+    fig.addEventListener("pointermove", onMove);
+    fig.addEventListener("pointerup", onUp);
+    fig.addEventListener("pointercancel", (e) => { if (drag && e.pointerId === drag.id) cancelPending(); });
     boxesEl = h("div", {});
+    edSlot = h("div", { class: "gal-ed-slot" });
+    drawBtn = canChange() ? h("button", { class: "btn small gal-draw-btn" + (ctx.draw.on ? " active" : ""), "aria-pressed": ctx.draw.on ? "true" : "false",
+      title: "draw a box the model missed: drag on the image (D)", onclick: () => toggleDraw() }, `${DRAWN_MARK} Draw box`) : null;
     body.replaceChildren(
       h("div", { class: "gal-full-wrap" }, fig),
       h("div", { class: "gal-detail" },
@@ -686,7 +856,9 @@ function galleryModal(ctx, list, start) {
           h("button", { class: "btn small", onclick: () => go(-1), title: "previous (←)" }, "←"),
           h("span", { class: "muted num" }, `${i + 1} / ${list.length}`),
           h("button", { class: "btn small", onclick: () => go(1), title: "next (→)" }, "→"),
+          drawBtn,
           h("button", { class: "btn small gal-close", onclick: close, title: "close (Esc)" }, "Close")),
+        edSlot,
         h("table", { class: "gal-kv" }, h("tbody", {},
           row("file", it.file), row("size", `${it.width} × ${it.height}`), row("text", it.text), row("seed", it.seed), row("session", it.session),
           ...Object.entries(it.tags || {}).map(([k, v]) => row(`tags.${k}`, v)),
@@ -694,7 +866,8 @@ function galleryModal(ctx, list, start) {
         boxesEl));
     paint();
   }
-  const wrap = h("div", { class: "gal-modal", role: "dialog", "aria-modal": "true", onclick: (e) => { if (e.target === wrap) close(); } }, body);
+  // a drag released over the backdrop must not close the view (its click lands on the common ancestor)
+  const wrap = h("div", { class: "gal-modal", role: "dialog", "aria-modal": "true", onclick: (e) => { if (e.target === wrap && !drag && Date.now() - justDrew > 400) close(); } }, body);
   document.addEventListener("keydown", onKey);
   ctx.listeners.add(paint);
   document.body.append(wrap);
@@ -721,7 +894,9 @@ function gallerySection(project, sets) {
   const kinds = [...new Set(sets.map((x) => x.kind).filter(Boolean))];
   let verdicts = new Map();   // vKey(file, id) -> {verdict, at, by}: the current index's only (the hub filters)
   const vOf = (file, id) => verdicts.get(vKey(file, id))?.verdict ?? null;
-  const f = { kind: "", slug: sets[0].slug, label: "", session: "", kept: "", review: "", thr: 0, vOf };
+  let added = new Map(), addedByFile = new Map();   // box_id -> drawn box {file, box_id, label, bbox, at, by}; file -> [boxes]
+  const addedOf = (file) => addedByFile.get(file) || [];
+  const f = { kind: "", slug: sets[0].slug, label: "", session: "", kept: "", review: "", thr: 0, vOf, addedOf };
   let index = null, colors = new Map(), shown = [], tiles = new Map(), upto = 0, raf = 0, loadSeq = 0, labelOpts = [""], byFile = new Map();
   const pending = new Map();   // vKey -> sequence number of the PUT in flight for it (a newer click wins)
   let vSeq = 0;
@@ -729,7 +904,9 @@ function gallerySection(project, sets) {
     if (!colors.has(lab)) colors.set(lab, `var(${SERIES[colors.size % SERIES.length]})`);
     return colors.get(lab);
   };
-  const ctx = { project, slug: () => f.slug, thr: () => f.thr, colorOf, vOf, review, setVerdict, listeners: new Set() };
+  const ctx = { project, slug: () => f.slug, thr: () => f.thr, colorOf, vOf, review, setVerdict, listeners: new Set(),
+    addedOf, addAdded, editAdded, deleteAdded, labels: () => drawLabels(index, [...added.values()]),
+    draw: { on: false, last: null } };   // draw mode (and the last label used) outlive stepping and reopening the view
 
   const opt = (v, label, sel = false) => h("option", { value: v, selected: sel ? "" : null }, label);
   const setSel = h("select", { title: "Image set" });
@@ -737,8 +914,8 @@ function gallerySection(project, sets) {
   const labelSel = h("select", { title: "Label: items with a box of it at or above the threshold" });
   const sessSel = h("select", { title: "Session" });
   const keptSel = h("select", { title: "Kept / dropped (tags.kept)" }, opt("", "kept + dropped", true), opt("kept", "kept"), opt("dropped", "dropped"));
-  const reviewSel = h("select", { title: "Review: per-box verdicts (boxes with an id)" }, opt("", "all (review)", true),
-    opt("unreviewed", "has unreviewed boxes"), opt("bad", "has bad boxes"), opt("done", "fully reviewed"));
+  const reviewSel = h("select", { title: "Review: per-box verdicts (boxes with an id) and boxes drawn by hand" }, opt("", "all (review)", true),
+    opt("unreviewed", "has unreviewed boxes"), opt("bad", "has bad boxes"), opt("done", "fully reviewed"), opt("drawn", "has drawn boxes"));
   const thrVal = h("span", { class: "num gal-thr-val" }, "0.00");
   const slider = h("input", { type: "range", min: "0", max: "1", step: "0.01", value: "0", class: "gal-thr", "aria-label": "score threshold" });
   const counts = h("div", { class: "gal-counts muted" });
@@ -747,7 +924,7 @@ function gallerySection(project, sets) {
   const grid = h("div", { class: "gal-grid" });
   const more = h("button", { class: "btn small gal-more", hidden: "" }, "show more");
   const sentinel = h("div", { class: "gal-sentinel" });
-  const delBtn = guard(h("button", { class: "btn small danger", title: "Delete this set from the hub (and its review)" }, "Delete set"));
+  const delBtn = guard(h("button", { class: "btn small danger", title: "Delete this set from the hub (and its review and drawn boxes)" }, "Delete set"));
   kindSel.hidden = kinds.length < 2;
 
   // ---- review: hit-test a click in image pixel space, toggle, PUT optimistically, roll back on error
@@ -788,10 +965,65 @@ function gallerySection(project, sets) {
         toast(`Review not saved: ${err.message}`, true);
       });
   }
+  // ---- drawn boxes: POST / PATCH / DELETE optimistically, roll back (and say so) on error
+  const addedUrl = (slug, id) => `/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(slug)}/added${id ? "/" + encodeURIComponent(id) : ""}`;
+  const addedRec = (r) => ({ file: r.file, box_id: r.box_id, label: r.label, bbox: r.bbox, at: r.at, by: r.by });
+  const pendingAdded = new Map();   // box_id -> sequence number of the PATCH / DELETE in flight for it (a newer one wins)
+  function reindexAdded() {
+    addedByFile = new Map();
+    for (const a of added.values()) (addedByFile.get(a.file) || addedByFile.set(a.file, []).get(a.file)).push(a);
+  }
+  function applyAdded(it, id, rec) {   // one drawn box created / changed (rec) or gone (null): tile, counts and view follow
+    if (rec) added.set(id, rec); else added.delete(id);
+    reindexAdded();
+    it._vrev = (it._vrev || 0) + 1;
+    if (tiles.get(it._i)) tileFor(it._i);
+    updateCounts();
+    updateReview();
+    for (const fn of ctx.listeners) fn();
+  }
+  function addAdded(it, label, bbox) {
+    const tmp = `tmp-${++vSeq}`, slug = f.slug;   // shown at once under a temporary id; the hub's id replaces it
+    applyAdded(it, tmp, { file: it.file, box_id: tmp, label, bbox, at: Date.now() / 1000, by: state.config?.user?.subject ?? null, _tmp: true });
+    post(addedUrl(slug), { file: it.file, label, bbox })
+      .then((r) => { if (slug === f.slug) { added.delete(tmp); applyAdded(it, r.box_id, addedRec(r)); } })
+      .catch((err) => {
+        if (slug === f.slug) applyAdded(it, tmp, null);   // roll back
+        toast(`Drawn box not saved: ${err.message}`, true);
+      });
+  }
+  function changeAdded(it, a, patch) {   // patch null: delete
+    const id = a.box_id, prev = added.get(id) || null, mine = ++vSeq, slug = f.slug;
+    if (!prev || prev._tmp) return;
+    pendingAdded.set(id, mine);
+    applyAdded(it, id, patch ? { ...prev, ...patch } : null);
+    post(addedUrl(slug, id), patch || undefined, patch ? "PATCH" : "DELETE")
+      .then((r) => { if (pendingAdded.get(id) === mine && slug === f.slug) { pendingAdded.delete(id); if (patch) applyAdded(it, id, addedRec(r)); } })
+      .catch((err) => {
+        if (pendingAdded.get(id) === mine && slug === f.slug) { pendingAdded.delete(id); applyAdded(it, id, prev); }   // roll back
+        toast(`Drawn box not ${patch ? "changed" : "deleted"}: ${err.message}`, true);
+      });
+  }
+  function editAdded(it, a, patch) { changeAdded(it, a, patch); }
+  function deleteAdded(it, a) { changeAdded(it, a, null); }
+  // live: drawn boxes created, changed or deleted by another operator (or echoes of this page's own)
+  const offAdded = on("gallery_added", (m) => {
+    if (!root.isConnected) { offAdded(); return; }
+    if (m.project !== project || m.slug !== f.slug || !index) return;
+    const it = byFile.get(m.file);
+    if (!it || typeof m.box_id !== "string" || pendingAdded.has(m.box_id)) return;   // ours in flight: its answer settles it
+    applyAdded(it, m.box_id, m.op === "delete" ? null : addedRec(m));
+  });
+  function updateCounts() {
+    if (!index) return;
+    let nBoxes = 0, nDrawn = 0;
+    for (const j of shown) { nBoxes += boxesAbove(index.items[j], f.thr).length; nDrawn += addedOf(index.items[j].file).length; }
+    counts.textContent = `showing ${shown.length} of ${index.items.length}, ${nBoxes} box${nBoxes === 1 ? "" : "es"} ≥ ${f.thr.toFixed(2)}, drawn ${nDrawn}`;
+  }
   function updateReview() {
     if (!index) return;
     const c = reviewCounts(index.items, vOf);
-    reviewSel.hidden = !c.n;
+    reviewSel.hidden = !c.n && !added.size;
     reviewLine.textContent = c.n ? `reviewed ${c.reviewed} / ${c.n} boxes (good ${c.good}, bad ${c.bad})` : "no box ids in this set: it can't be reviewed";
   }
   // live: another operator's (or this page's own) verdicts
@@ -822,7 +1054,7 @@ function gallerySection(project, sets) {
     }
     if (t._thr !== f.thr || t._vrev !== (it._vrev || 0)) {   // (re)draw the overlay for the threshold and verdicts
       t.querySelector(".gal-ovl")?.remove();
-      t.append(boxOverlay(it, f.thr, colorOf, false, vOf));
+      t.append(boxOverlay(it, f.thr, colorOf, false, vOf, addedOf(it.file)));
       t._thr = f.thr; t._vrev = it._vrev || 0;
     }
     return t;
@@ -836,9 +1068,7 @@ function gallerySection(project, sets) {
   function refresh(keep = false) {   // keep: as many tiles as were already shown (a threshold move keeps the scroll)
     const want = keep ? Math.max(upto, CHUNK) : CHUNK;
     shown = filterItems(index.items, f).map((it) => it._i);
-    let nBoxes = 0;
-    for (const j of shown) nBoxes += boxesAbove(index.items[j], f.thr).length;
-    counts.textContent = `showing ${shown.length} of ${index.items.length}, ${nBoxes} box${nBoxes === 1 ? "" : "es"} ≥ ${f.thr.toFixed(2)}`;
+    updateCounts();
     updateReview();
     grid.replaceChildren();
     upto = 0;
@@ -851,17 +1081,20 @@ function gallerySection(project, sets) {
     index = null;
     grid.replaceChildren(h("div", { class: "muted gal-none" }, "Loading…"));
     const base = `/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(f.slug)}`;
-    let doc, vs;
+    let doc, vs, ad;
     try {
-      [doc, vs] = await Promise.all([api(base), api(base + "/verdicts").catch((e) => { toast(`Cannot load the review: ${e.message}`, true); return { verdicts: [] }; })]);
+      [doc, vs, ad] = await Promise.all([api(base), api(base + "/verdicts").catch((e) => { toast(`Cannot load the review: ${e.message}`, true); return { verdicts: [] }; }),
+        api(base + "/added").catch((e) => { toast(`Cannot load the drawn boxes: ${e.message}`, true); return { added: [] }; })]);
     } catch (e) { if (seq === loadSeq) grid.replaceChildren(h("div", { class: "muted gal-none" }, `Cannot load this set: ${e.message}`)); return; }
     if (seq !== loadSeq) return;   // another set was picked meanwhile
     doc.items = (Array.isArray(doc.items) ? doc.items : []).filter((it) => it && num(it.width) > 0 && num(it.height) > 0);
     doc.items.forEach((it, j) => { it._i = j; });
-    index = doc; tiles = new Map(); colors = new Map(); pending.clear();
+    index = doc; tiles = new Map(); colors = new Map(); pending.clear(); pendingAdded.clear();
     byFile = new Map(doc.items.map((it) => [it.file, it]));
+    added = new Map((ad?.added || []).filter((a) => typeof a?.box_id === "string" && byFile.has(a.file)).map((a) => [a.box_id, addedRec(a)]));
+    reindexAdded();
     verdicts = new Map((vs?.verdicts || []).filter((v) => v.verdict === "good" || v.verdict === "bad").map((v) => [vKey(v.file, v.box_id), { verdict: v.verdict, at: v.at, by: v.by }]));
-    for (const l of [...(doc.labels || []), ...doc.items.flatMap((it) => (it.boxes || []).map((b) => b.label))]) colorOf(l);
+    for (const l of [...(doc.labels || []), ...doc.items.flatMap((it) => (it.boxes || []).map((b) => b.label)), ...[...added.values()].map((a) => a.label)]) colorOf(l);
     const sessions = [...new Set(doc.items.map((it) => it.session).filter((v) => v != null).map(String))].sort();
     f.label = ""; f.session = ""; f.review = ""; reviewSel.value = "";
     // option values index labelOpts (labels are arbitrary strings; NO_BOX is not a string at all)
@@ -877,7 +1110,8 @@ function gallerySection(project, sets) {
       h("span", {}, `pushed ${m.pushed_at ? fmt.ago(Date.now() / 1000 - m.pushed_at) : "?"}${m.host ? " from " + m.host : ""}`),
       m.thumbs === false ? h("span", {}, "no thumbnails: tiles load full images") : null,
       h("span", { class: "viz-legend" }, [...colors.keys()].map((l) => h("span", {}, h("i", { class: "lg-sw", style: `background:${colorOf(l)}` }), l)),
-        h("span", { class: "gal-v-good" }, `${VERDICT_MARK.good} good`), h("span", { class: "gal-v-bad" }, `${VERDICT_MARK.bad} bad`)),
+        h("span", { class: "gal-v-good" }, `${VERDICT_MARK.good} good`), h("span", { class: "gal-v-bad" }, `${VERDICT_MARK.bad} bad`),
+        h("span", { class: "gal-drawn-key" }, `${DRAWN_MARK} drawn`)),
     ].filter(Boolean));
     refresh();
   }
@@ -895,7 +1129,7 @@ function gallerySection(project, sets) {
   more.addEventListener("click", renderMore);
   delBtn.addEventListener("click", async () => {
     const m = sets.find((x) => x.slug === f.slug);
-    if (!m || !confirm(`Delete the image set "${m.set}" (${m.items} items) and its review from the hub?`)) return;
+    if (!m || !confirm(`Delete the image set "${m.set}" (${m.items} items), its review and its drawn boxes from the hub?`)) return;
     try { await post(`/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(m.slug)}`, undefined, "DELETE"); toast(`Deleted ${m.set}`); renderResearch({ project }); }
     catch (e) { toast(e.message, true); }
   });

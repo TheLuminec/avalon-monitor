@@ -637,6 +637,8 @@ function connectWs() {
     else if (msg.type === "claude_untracked") emit("claude_untracked", msg);
     else if (msg.type === "results") emit("results", msg);
     else if (msg.type === "gallery") emit("gallery", msg);
+    // per-box review and drawn boxes (research.js applies them live; login-only events, so only signed-in sockets get them)
+    else if (msg.type === "gallery_verdict" || msg.type === "gallery_added") emit(msg.type, msg);
   };
   ws.onclose = (ev) => {
     state.live = false; $("#conn").className = "conn"; clearInterval(ping);

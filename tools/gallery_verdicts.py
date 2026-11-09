@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Fetch a gallery set's per-box review (the good/bad verdicts marked on the research page) for a training pipeline.
+"""Fetch a gallery set's per-box review (the good/bad verdicts and the boxes drawn by hand on the research page) for a
+training pipeline.
 
     python3 tools/gallery_verdicts.py PROJECT SET-OR-SLUG [--out FILE] [--config agent.conf]
 
@@ -7,10 +8,14 @@ SET-OR-SLUG is the set's name as pushed (e.g. "synthetic/cup/sd15_lcm_esp32v2") 
 ("synthetic__cup__sd15_lcm_esp32v2"); the slug is derived the same way the hub derives it. Writes, to stdout or --out:
 
     {"project", "set", "slug", "exported_at": ISO-8601,
-     "verdicts": [{"file", "box_id", "verdict": "good" | "bad", "at": ISO-8601, "by": reviewer}]}
+     "verdicts": [{"file", "box_id", "verdict": "good" | "bad", "at": ISO-8601, "by": reviewer}],
+     "added": [{"file", "box_id": "u" + 8 hex, "label", "bbox": [x, y, w, h], "at": ISO-8601, "by": reviewer}]}
 
-Only verdicts whose (file, box_id) is in the set's current index are exported: the hub keeps verdicts across
-re-pushes, and those for boxes a later push dropped stay stored but are left out here.
+"added" are boxes an operator drew where the teacher model missed the object: owner-confirmed positives (bbox in
+image pixels from the top-left, clamped to the image). Written through exactly as the hub sends them.
+
+Only verdicts whose (file, box_id) is in the set's current index, and drawn boxes whose file is, are exported: the hub
+keeps both across re-pushes, and those for boxes or files a later push dropped stay stored but are left out here.
 
 Reads GET /api/v1/agent/projects/<project>/galleries/<slug>/verdicts with this host's agent token (read-only).
 Hub URL and token come from agent.conf, found like gallery_push.py / avm find it: --config, $AVM_CONFIG,
@@ -87,7 +92,7 @@ def fetch(cfg: dict, project: str, slug: str) -> dict:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Fetch a gallery set's per-box review (good/bad verdicts) as JSON.")
+    ap = argparse.ArgumentParser(description="Fetch a gallery set's per-box review (good/bad verdicts, drawn boxes) as JSON.")
     ap.add_argument("project")
     ap.add_argument("set", help="the set's name as pushed, or its slug")
     ap.add_argument("--out", default="", help="write the JSON here (default: stdout)")
@@ -119,7 +124,8 @@ def main(argv=None) -> int:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
         os.replace(tmp, a.out)
-        print("%s / %s: %d verdicts -> %s" % (doc.get("project"), doc.get("set"), len(doc.get("verdicts") or []), a.out), file=sys.stderr)
+        print("%s / %s: %d verdicts, %d drawn boxes -> %s" % (doc.get("project"), doc.get("set"), len(doc.get("verdicts") or []),
+                                                             len(doc.get("added") or []), a.out), file=sys.stderr)
     else:
         sys.stdout.write(text)
     return 0

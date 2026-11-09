@@ -159,7 +159,7 @@ upload and unpacked) and 20,000 items, and the hub stores it under `<dir of AVM_
 A data-use host (`AVM_DATA_USE`) is refused with 403: a gallery is raw images. Everything pushed is
 visible to every dashboard viewer with an Access login, so push only images anyone who can sign in may see.
 
-Galleries are **login-only**: every gallery read (the set list, index, images, thumbnails and verdicts) needs the
+Galleries are **login-only**: every gallery read (the set list, index, images, thumbnails, verdicts and drawn boxes) needs the
 Cloudflare Access login (`require_login`). Trusted-network viewers (tailnet/LAN, no login) get 403 there, see
 `galleries: 0` and no gallery-only projects in `/api/v1/projects`, and do not receive gallery websocket events;
 their research page shows the Gallery section with a note to open the page through the public address instead.
@@ -180,11 +180,32 @@ Viewers who can't change things see the verdicts but can't set them. The API:
 `PUT` on the same path with `{"file", "box_id", "verdict": "good" | "bad" | null}` (operators only, like deleting a
 set; `null` clears; 404 for a file or box id not in the current index, 422 for another verdict). For training
 pipelines, `GET /api/v1/agent/projects/<p>/galleries/<slug>/verdicts` takes an agent token and returns
-`{"project", "set", "slug", "exported_at", "verdicts": [{"file", "box_id", "verdict", "at", "by"}]}` (ISO times);
+`{"project", "set", "slug", "exported_at", "verdicts": [{"file", "box_id", "verdict", "at", "by"}], "added": [...]}`
+(ISO times; "added" is the drawn boxes, below);
 `python3 tools/gallery_verdicts.py <project> <set-or-slug> [--out FILE] [--config PATH]` (stdlib, finds `agent.conf`
 like the pusher) writes that JSON to stdout or FILE. **Verdicts survive re-pushes**: they are keyed by
 (set, file, box id), and every reader only counts those whose box is in the current index; the others stay stored
 (and return if a later push brings the box back). Deleting the set deletes its verdicts.
+
+**Drawing missing boxes.** The teacher model misses objects, so an operator can add a box by hand in the full-size
+view: press **D** (or the "✎ Draw box" button) and drag on the image (a drag that leaves the image is clamped to it;
+one under 4 px either way is ignored). Click / right-click review is suspended while drawing. On release an inline
+editor beside the image asks for the label: one of the set's labels, or "other…" for a new class (any name up to 40
+characters); **Enter** saves, **Esc** cancels that box only (it doesn't close the view). Draw mode stays on for the
+next box until you toggle it off. Drawn boxes are always shown whatever the score slider says, solid with a dark
+outline and "✎" before the label, in the grid too; they have no score and are never picked by the good/bad click. The
+box list shows each as its own row (source "drawn") with a re-label select and a **delete** button; the set's counts
+add "drawn d" and the review filter has "has drawn boxes". Read-only viewers see them but can't change them. The API
+(writes operators only): `GET /api/v1/projects/<p>/galleries/<slug>/added` (signed-in viewers) →
+`{"added": [{"file", "box_id", "label", "bbox": [x, y, w, h], "at", "by"}]}`; `POST` on it with
+`{"file", "label", "bbox"}` (404 for a file not in the current index; 422 for a label that isn't a non-empty string of
+at most 40 characters, a bbox that isn't 4 finite numbers, or one under 2 px either way once clamped to the image) returns
+the stored box, whose `box_id` the hub makes (`"u"` + 8 hex characters, distinct from teacher ids);
+`PATCH .../added/<box_id>` with `{"label"?, "bbox"?}` (same checks) and `DELETE .../added/<box_id>`. Like verdicts,
+drawn boxes survive re-pushes, are reported only while their file is in the current index (the others stay stored),
+and are deleted with the set. The agent export (and so `tools/gallery_verdicts.py`) carries them next to the
+verdicts: `"added": [{"file", "box_id", "label", "bbox", "at", "by"}]` (ISO times). **Drawn boxes are
+owner-confirmed positives**: use them as ground truth for training and the real test set, not as model output.
 
 Claude sessions launched from the Agents tab are told (via system prompt) to wrap
 long-running work in `avm run`, so their training runs show up as tasks.

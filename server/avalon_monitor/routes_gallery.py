@@ -18,6 +18,12 @@ verdicts live in the DB (gallery_verdicts), keyed by (project, slug, file, box_i
 reader (the page, the counts, the agent export for training pipelines) only sees verdicts whose (file, box_id) is in
 the set's current index; the others stay stored and come back if a later push brings the box back. Deleting the set
 deletes its verdicts.
+
+Drawn boxes: the teacher model misses objects, so an operator can draw a box by hand in the full-size view (POST
+.../added, then PATCH / DELETE .../added/<box_id>). They live in the DB (gallery_added_boxes) with a hub-made id
+("u" + 8 hex characters), are clamped to the image, and follow the verdicts' rules: kept across re-pushes, reported
+only while their file is in the current index, deleted with the set. The agent export carries them next to the
+verdicts ("added"): owner-confirmed positives for training and the real test set.
 """
 from __future__ import annotations
 
@@ -27,6 +33,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import stat
 import tempfile
@@ -60,6 +67,8 @@ IMAGE_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,199}$")
 BOX_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 VERDICTS = ("good", "bad")
+LABEL_MAX_CHARS = 40   # a drawn box's label (any string: a class the set's labels don't have yet is fine)
+MIN_DRAWN_PX = 2       # a drawn box narrower or lower than this, after clamping to the image, is refused
 _BAD_CHARS = re.compile(r"[\x00-\x1f\x7f\\:]")   # control characters, backslashes, drive letters
 CACHE = {"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"}
 _swap_lock = threading.Lock()
@@ -423,19 +432,27 @@ async def gallery_delete(project: str, slug: str, ident: Identity = Depends(requ
         raise HTTPException(404, "no such gallery set") from None
     await run_in_threadpool(shutil.rmtree, gone, True)
     await run_in_threadpool(db.verdicts_delete_set, project, slug)
+    await run_in_threadpool(db.added_delete_set, project, slug)
     log.info("gallery %s/%s deleted by %s", project, slug, ident.subject)
     await hub.broadcast({"type": "gallery", "project": project, "slug": slug, "deleted": True}, login_only=True)
     return {"ok": True}
 
 
 # ------------------------------------------------------------------ per-box review
-_ids_cache: dict[str, tuple[tuple, str, frozenset]] = {}
+_ids_cache: dict[str, tuple[tuple, str, frozenset, dict]] = {}
 _ids_lock = threading.Lock()
 
 
 def index_boxes(d: Path) -> tuple[str, frozenset]:
-    """(set display name, {(file, box_id)} of every box with an id) from a set's current index. Cached per index file
-    (inode, mtime, size): a re-push swaps in a new file, so the cache never answers for a replaced index."""
+    """(set display name, {(file, box_id)} of every box with an id) from a set's current index."""
+    name, ids, _ = index_info(d)
+    return name, ids
+
+
+def index_info(d: Path) -> tuple[str, frozenset, dict]:
+    """(set display name, {(file, box_id)} of every box with an id, {file: (width, height)}) from a set's current
+    index. Cached per index file (inode, mtime, size): a re-push swaps in a new file, so the cache never answers for a
+    replaced index."""
     p = d / "index.json"
     try:
         st = p.stat()
@@ -445,18 +462,19 @@ def index_boxes(d: Path) -> tuple[str, frozenset]:
     with _ids_lock:
         hit = _ids_cache.get(key)
         if hit and hit[0] == stamp:
-            return hit[1], hit[2]
+            return hit[1], hit[2], hit[3]
     try:
         doc = json.loads(p.read_text("utf-8"))
     except (OSError, ValueError):
         raise HTTPException(404, "no such gallery set") from None
     ids = frozenset((it["file"], b["id"]) for it in doc.get("items") or [] for b in it.get("boxes") or [] if "id" in b)
+    dims = {it["file"]: (it["width"], it["height"]) for it in doc.get("items") or []}
     name = doc.get("set") or ""
     with _ids_lock:
         if len(_ids_cache) > 64:
             _ids_cache.clear()
-        _ids_cache[key] = (stamp, name, ids)
-    return name, ids
+        _ids_cache[key] = (stamp, name, ids, dims)
+    return name, ids, dims
 
 
 def current_verdicts(project: str, slug: str) -> tuple[str, list[dict]]:
@@ -504,5 +522,109 @@ async def gallery_verdict_put(project: str, slug: str, request: Request, ident: 
 async def gallery_verdicts_export(project: str, slug: str, host: HostRow = Depends(require_agent)):
     """Read-only, with an agent token: the review, for a training pipeline (tools/gallery_verdicts.py)."""
     name, verdicts = await run_in_threadpool(current_verdicts, project, slug)
+    added = await run_in_threadpool(current_added, project, slug)
     return {"project": project, "set": name, "slug": slug, "exported_at": _iso(time.time()),
-            "verdicts": [{**v, "at": _iso(v["at"])} for v in verdicts]}
+            "verdicts": [{**v, "at": _iso(v["at"])} for v in verdicts],
+            "added": [{**a, "at": _iso(a["at"])} for a in added]}
+
+
+# ------------------------------------------------------------------ drawn boxes
+def current_added(project: str, slug: str) -> list[dict]:
+    """The stored drawn boxes whose file is in the current index. Orphans stay in the DB, unreported."""
+    _, _, dims = index_info(_set_dir(project, slug))
+    return [a for a in db.added_list(project, slug) if a["file"] in dims]
+
+
+def check_label(v: Any) -> str:
+    """A drawn box's label: a non-empty string of at most LABEL_MAX_CHARS, no control characters (surrounding blanks
+    dropped). Not limited to the set's labels: a class the teacher doesn't know is the point."""
+    if not isinstance(v, str) or not v.strip() or len(v.strip()) > LABEL_MAX_CHARS or re.search(r"[\x00-\x1f\x7f]", v):
+        raise HTTPException(422, f"label must be a non-empty string of at most {LABEL_MAX_CHARS} characters")
+    return v.strip()
+
+
+def clamp_bbox(v: Any, width: int, height: int) -> list[float]:
+    """[x, y, w, h] (4 finite numbers) clamped to the image (0..width, 0..height), rounded to 0.01 px. 422 if it is
+    not 4 numbers, or if what is left inside the image is narrower or lower than MIN_DRAWN_PX."""
+    if not (isinstance(v, list) and len(v) == 4 and all(_finite(x) for x in v)):
+        raise HTTPException(422, "bbox must be [x, y, w, h]: 4 finite numbers, in image pixels from the top-left")
+    x, y, w, h = (float(t) for t in v)
+    x0, y0 = min(max(x, 0.0), width), min(max(y, 0.0), height)
+    x1, y1 = min(max(x + w, 0.0), width), min(max(y + h, 0.0), height)
+    if x1 - x0 < MIN_DRAWN_PX or y1 - y0 < MIN_DRAWN_PX:
+        raise HTTPException(422, f"bbox is smaller than {MIN_DRAWN_PX} x {MIN_DRAWN_PX} px inside the image "
+                                 f"({width} x {height}) after clamping")
+    return [round(x0, 2), round(y0, 2), round(x1 - x0, 2), round(y1 - y0, 2)]
+
+
+async def _body(request: Request, what: str) -> dict:
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(422, f"body must be JSON {what}") from None
+    if not isinstance(body, dict):
+        raise HTTPException(422, f"body must be a JSON object {what}")
+    return body
+
+
+def _current_box(project: str, slug: str, d: Path, box_id: str) -> tuple[dict, tuple[int, int]]:
+    """A drawn box whose file is in the current index, and that file's (width, height); 404 otherwise (an orphan
+    can't be changed until a push brings its file back)."""
+    row = db.added_get(project, slug, box_id) if isinstance(box_id, str) and BOX_ID_RE.match(box_id) else None
+    dims = index_info(d)[2]
+    if row is None or row["file"] not in dims:
+        raise HTTPException(404, "no drawn box with that id on a file in this set's current index")
+    return row, dims[row["file"]]
+
+
+@router.get("/projects/{project}/galleries/{slug}/added")
+async def gallery_added(project: str, slug: str, ident: Identity = Depends(require_login)):
+    return {"added": await run_in_threadpool(current_added, project, slug)}
+
+
+@router.post("/projects/{project}/galleries/{slug}/added")
+async def gallery_added_post(project: str, slug: str, request: Request, ident: Identity = Depends(require_operator)):
+    """Body {file, label, bbox: [x, y, w, h]}. The file must be in the current index; the bbox is clamped to it."""
+    d = _set_dir(project, slug)
+    body = await _body(request, "{file, label, bbox}")
+    file = body.get("file")
+    dims = (await run_in_threadpool(index_info, d))[2]
+    if not isinstance(file, str) or file not in dims:
+        raise HTTPException(404, "no such file in this set's current index")
+    label, bbox = check_label(body.get("label")), clamp_bbox(body.get("bbox"), *dims[file])
+    row = None
+    while row is None:   # 32 bits per id: a clash within one set is all but impossible, but cheap to retry
+        row = await run_in_threadpool(db.added_insert, project, slug, file, "u" + secrets.token_hex(4), label, bbox, ident.subject)
+    log.info("gallery %s/%s drawn box %s#%s %s %s by %s", project, slug, file, row["box_id"], label, bbox, ident.subject)
+    await hub.broadcast({"type": "gallery_added", "project": project, "slug": slug, "op": "create", **row}, login_only=True)
+    return {"ok": True, **row}
+
+
+@router.patch("/projects/{project}/galleries/{slug}/added/{box_id}")
+async def gallery_added_patch(project: str, slug: str, box_id: str, request: Request, ident: Identity = Depends(require_operator)):
+    """Body {label?, bbox?}: relabel and/or move a drawn box, validated like a new one."""
+    d = _set_dir(project, slug)
+    body = await _body(request, "{label?, bbox?}")
+    if "label" not in body and "bbox" not in body:
+        raise HTTPException(422, "nothing to change: give label and/or bbox")
+    cur, (width, height) = await run_in_threadpool(_current_box, project, slug, d, box_id)
+    label = check_label(body["label"]) if "label" in body else cur["label"]
+    bbox = clamp_bbox(body["bbox"], width, height) if "bbox" in body else cur["bbox"]
+    row = await run_in_threadpool(db.added_update, project, slug, box_id, label, bbox, ident.subject)
+    if row is None:   # deleted meanwhile
+        raise HTTPException(404, "no drawn box with that id on a file in this set's current index")
+    log.info("gallery %s/%s drawn box %s#%s -> %s %s by %s", project, slug, row["file"], box_id, label, bbox, ident.subject)
+    await hub.broadcast({"type": "gallery_added", "project": project, "slug": slug, "op": "update", **row}, login_only=True)
+    return {"ok": True, **row}
+
+
+@router.delete("/projects/{project}/galleries/{slug}/added/{box_id}")
+async def gallery_added_delete(project: str, slug: str, box_id: str, ident: Identity = Depends(require_operator)):
+    d = _set_dir(project, slug)
+    cur, _ = await run_in_threadpool(_current_box, project, slug, d, box_id)
+    if not await run_in_threadpool(db.added_delete, project, slug, box_id):
+        raise HTTPException(404, "no drawn box with that id on a file in this set's current index")
+    log.info("gallery %s/%s drawn box %s#%s deleted by %s", project, slug, cur["file"], box_id, ident.subject)
+    await hub.broadcast({"type": "gallery_added", "project": project, "slug": slug, "op": "delete", "file": cur["file"],
+                         "box_id": box_id, "by": ident.subject}, login_only=True)
+    return {"ok": True}
