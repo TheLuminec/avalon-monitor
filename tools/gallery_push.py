@@ -8,8 +8,10 @@ INDEX.json (written by the project, one per set):
      "image_root": "<abs dir: where the files are; used only here, never sent>", "labels": ["cup", ...],
      "items": [{"file": "000123.jpg", "width": 512, "height": 512, "text": "...", "seed": 123, "session": null,
                 "tags": {"kept": true, "reason": null, "luma": 64.0},
-                "boxes": [{"label": "cup", "score": 0.41, "bbox": [x, y, w, h]}]}]}
-bbox in pixels, top-left origin; tags flat, scalar values only; file relative to image_root.
+                "boxes": [{"id": "c1a2b3", "label": "cup", "score": 0.41, "bbox": [x, y, w, h]}]}]}
+bbox in pixels, top-left origin; tags flat, scalar values only; file relative to image_root. A box's "id" is
+optional ([A-Za-z0-9_-]{1,32}, unique within its item, stable across re-exports): only boxes with one can be
+reviewed (good/bad) on the dashboard; tools/gallery_verdicts.py fetches that review.
 
 Builds a zip (index.json without image_root + images/<file> + thumbs/<file>.jpg, ~320 px, when Pillow is
 importable; without it the hub serves the full images as thumbnails) and streams it to
@@ -36,6 +38,7 @@ import urllib.request
 import zipfile
 
 PROJECT_RE = re.compile(r"^[a-z0-9_-]{1,40}$")
+BOX_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")   # optional per-box "id": what the dashboard's per-box review keys on
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp")
 MAX_ITEMS = 20_000
 THUMB_PX = 320
@@ -131,6 +134,11 @@ def check_index(doc) -> list:
             if not (isinstance(b, dict) and isinstance(b.get("label"), str) and _finite(b.get("score"))
                     and isinstance(bb, list) and len(bb) == 4 and all(_finite(x) for x in bb)):
                 errs.append("%s.boxes[%d] needs a string label, a numeric score and bbox [x, y, w, h]" % (w, j))
+        ids = [b.get("id") for b in it.get("boxes") or [] if isinstance(b, dict) and b.get("id") is not None]
+        if not all(isinstance(x, str) and BOX_ID_RE.match(x) for x in ids):
+            errs.append(w + ".boxes: an id must be 1-32 characters of A-Z a-z 0-9 _ -")
+        elif len(set(ids)) != len(ids):
+            errs.append(w + ".boxes: box ids must be unique within an item")
         if len(errs) > 20:
             errs.append("...")
             break

@@ -11,6 +11,13 @@ max_payload_bytes does not apply here), every zip entry name is checked before a
 paths, no "..", no symlinks or special files, only index.json / images/* / thumbs/* with an image extension), sizes
 are checked from the zip headers and again while extracting (zip bombs), and the index must describe exactly what
 was sent. A re-push of the same set replaces it atomically: unpacked beside it, then swapped in with one rename.
+
+Per-box review: a box may carry an "id" ([A-Za-z0-9_-]{1,32}, unique within its item; Tinyseek uses a short hash of
+label + rounded bbox, stable across re-exports). An operator marks such a box good or bad (PUT .../verdicts); the
+verdicts live in the DB (gallery_verdicts), keyed by (project, slug, file, box_id), so they outlive re-pushes. Every
+reader (the page, the counts, the agent export for training pipelines) only sees verdicts whose (file, box_id) is in
+the set's current index; the others stay stored and come back if a later push brings the box back. Deleting the set
+deletes its verdicts.
 """
 from __future__ import annotations
 
@@ -27,6 +34,7 @@ import threading
 import time
 import uuid
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -37,7 +45,7 @@ from starlette.concurrency import run_in_threadpool
 from . import datause
 from .auth import Identity
 from .config import settings
-from .core import hub, require_agent, require_operator, require_viewer
+from .core import db, hub, require_agent, require_login, require_operator
 from .db import HostRow
 from .routes_results import PROJECT_RE, _project
 
@@ -50,6 +58,8 @@ MAX_ENTRIES = 2 * MAX_ITEMS + 200       # images + thumbs + index + directory en
 SET_MAX_CHARS = 120
 IMAGE_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,199}$")
+BOX_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+VERDICTS = ("good", "bad")
 _BAD_CHARS = re.compile(r"[\x00-\x1f\x7f\\:]")   # control characters, backslashes, drive letters
 CACHE = {"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"}
 _swap_lock = threading.Lock()
@@ -167,13 +177,23 @@ def validate_index(project: str, doc: Any, images: set[str]) -> dict:
         boxes = it.get("boxes") if it.get("boxes") is not None else []
         if not isinstance(boxes, list):
             raise HTTPException(422, f"{where}.boxes must be a list")
-        nb = []
+        nb, ids = [], set()
         for j, b in enumerate(boxes):
             bb = b.get("bbox") if isinstance(b, dict) else None
             if not (isinstance(b, dict) and isinstance(b.get("label"), str) and _finite(b.get("score"))
                     and isinstance(bb, list) and len(bb) == 4 and all(_finite(x) for x in bb)):
                 raise HTTPException(422, f"{where}.boxes[{j}] needs a string label, a numeric score and bbox [x, y, w, h]")
-            nb.append({"label": b["label"], "score": b["score"], "bbox": bb})
+            box = {"label": b["label"], "score": b["score"], "bbox": bb}
+            bid = b.get("id")
+            if bid is not None:   # optional: a box without an id simply can't be reviewed
+                if not isinstance(bid, str) or not BOX_ID_RE.match(bid):
+                    raise HTTPException(422, f"{where}.boxes[{j}].id must be 1-32 characters of A-Z a-z 0-9 _ -")
+                if bid in ids:
+                    raise HTTPException(422, f"{where}.boxes[{j}].id {bid!r} appears twice in this item"
+                                             " (box ids must be unique within an item)")
+                ids.add(bid)
+                box["id"] = bid
+            nb.append(box)
             if b["label"] not in seen_labels:
                 seen_labels.append(b["label"])
         for k in ("text", "seed", "session"):
@@ -313,7 +333,7 @@ async def gallery_push(project: str, request: Request, host: HostRow = Depends(r
     finally:
         path.unlink(missing_ok=True)
     log.info("gallery %s/%s pushed from %s: %d items, %d bytes", project, meta["slug"], host.name, meta["items"], meta["bytes"])
-    await hub.broadcast({"type": "gallery", "project": project, "slug": meta["slug"]})
+    await hub.broadcast({"type": "gallery", "project": project, "slug": meta["slug"]}, login_only=True)
     return {"ok": True, "project": project, **meta}
 
 
@@ -364,18 +384,18 @@ def _file_in(base: Path, rel: str) -> Optional[Path]:
 
 
 @router.get("/projects/{project}/galleries")
-async def gallery_list(project: str, ident: Identity = Depends(require_viewer)):
+async def gallery_list(project: str, ident: Identity = Depends(require_login)):
     return {"project": project, "galleries": await run_in_threadpool(list_sets, _project(project))}
 
 
 @router.get("/projects/{project}/galleries/{slug}")
-async def gallery_index(project: str, slug: str, ident: Identity = Depends(require_viewer)):
+async def gallery_index(project: str, slug: str, ident: Identity = Depends(require_login)):
     d = _set_dir(project, slug)
     return Response((d / "index.json").read_bytes(), media_type="application/json", headers={"Cache-Control": "no-cache"})
 
 
 @router.get("/projects/{project}/galleries/{slug}/image/{file:path}")
-async def gallery_image(project: str, slug: str, file: str, ident: Identity = Depends(require_viewer)):
+async def gallery_image(project: str, slug: str, file: str, ident: Identity = Depends(require_login)):
     p = _file_in(_set_dir(project, slug) / "images", file)
     if p is None:
         raise HTTPException(404, "no such image")
@@ -383,7 +403,7 @@ async def gallery_image(project: str, slug: str, file: str, ident: Identity = De
 
 
 @router.get("/projects/{project}/galleries/{slug}/thumb/{file:path}")
-async def gallery_thumb(project: str, slug: str, file: str, ident: Identity = Depends(require_viewer)):
+async def gallery_thumb(project: str, slug: str, file: str, ident: Identity = Depends(require_login)):
     """The ~320 px thumbnail; the full image when the set was pushed without thumbnails (no Pillow on the pusher)."""
     d = _set_dir(project, slug)
     p = _file_in(d / "thumbs", file + ".jpg") if safe_rel(file) else None
@@ -402,6 +422,87 @@ async def gallery_delete(project: str, slug: str, ident: Identity = Depends(requ
     except OSError:
         raise HTTPException(404, "no such gallery set") from None
     await run_in_threadpool(shutil.rmtree, gone, True)
+    await run_in_threadpool(db.verdicts_delete_set, project, slug)
     log.info("gallery %s/%s deleted by %s", project, slug, ident.subject)
-    await hub.broadcast({"type": "gallery", "project": project, "slug": slug, "deleted": True})
+    await hub.broadcast({"type": "gallery", "project": project, "slug": slug, "deleted": True}, login_only=True)
     return {"ok": True}
+
+
+# ------------------------------------------------------------------ per-box review
+_ids_cache: dict[str, tuple[tuple, str, frozenset]] = {}
+_ids_lock = threading.Lock()
+
+
+def index_boxes(d: Path) -> tuple[str, frozenset]:
+    """(set display name, {(file, box_id)} of every box with an id) from a set's current index. Cached per index file
+    (inode, mtime, size): a re-push swaps in a new file, so the cache never answers for a replaced index."""
+    p = d / "index.json"
+    try:
+        st = p.stat()
+    except OSError:
+        raise HTTPException(404, "no such gallery set") from None
+    key, stamp = str(p), (st.st_ino, st.st_mtime_ns, st.st_size)
+    with _ids_lock:
+        hit = _ids_cache.get(key)
+        if hit and hit[0] == stamp:
+            return hit[1], hit[2]
+    try:
+        doc = json.loads(p.read_text("utf-8"))
+    except (OSError, ValueError):
+        raise HTTPException(404, "no such gallery set") from None
+    ids = frozenset((it["file"], b["id"]) for it in doc.get("items") or [] for b in it.get("boxes") or [] if "id" in b)
+    name = doc.get("set") or ""
+    with _ids_lock:
+        if len(_ids_cache) > 64:
+            _ids_cache.clear()
+        _ids_cache[key] = (stamp, name, ids)
+    return name, ids
+
+
+def current_verdicts(project: str, slug: str) -> tuple[str, list[dict]]:
+    """(set name, the stored verdicts whose box is in the current index). Orphans stay in the DB, unreported."""
+    name, ids = index_boxes(_set_dir(project, slug))
+    return name, [v for v in db.verdicts_list(project, slug) if (v["file"], v["box_id"]) in ids]
+
+
+def _iso(t: float) -> str:
+    return datetime.fromtimestamp(t, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@router.get("/projects/{project}/galleries/{slug}/verdicts")
+async def gallery_verdicts(project: str, slug: str, ident: Identity = Depends(require_login)):
+    _, verdicts = await run_in_threadpool(current_verdicts, project, slug)
+    return {"verdicts": verdicts}
+
+
+@router.put("/projects/{project}/galleries/{slug}/verdicts")
+async def gallery_verdict_put(project: str, slug: str, request: Request, ident: Identity = Depends(require_operator)):
+    """Body {file, box_id, verdict: "good" | "bad" | null}; null clears it. The box must be in the current index."""
+    d = _set_dir(project, slug)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(422, "body must be JSON {file, box_id, verdict}") from None
+    if not isinstance(body, dict) or "verdict" not in body:
+        raise HTTPException(422, "body must be a JSON object {file, box_id, verdict}")
+    file, box_id, verdict = body.get("file"), body.get("box_id"), body["verdict"]
+    if verdict is not None and verdict not in VERDICTS:
+        raise HTTPException(422, 'verdict must be "good", "bad" or null (clears it)')
+    if not isinstance(file, str) or not isinstance(box_id, str):
+        raise HTTPException(422, "file and box_id must be strings")
+    _, ids = await run_in_threadpool(index_boxes, d)
+    if (file, box_id) not in ids:
+        raise HTTPException(404, "no box with that id on that file in this set's current index")
+    row = await run_in_threadpool(db.verdict_set, project, slug, file, box_id, verdict, ident.subject)
+    out = row or {"file": file, "box_id": box_id, "verdict": None, "at": time.time(), "by": ident.subject}
+    log.info("gallery %s/%s verdict %s#%s -> %s by %s", project, slug, file, box_id, verdict, ident.subject)
+    await hub.broadcast({"type": "gallery_verdict", "project": project, "slug": slug, **out}, login_only=True)
+    return {"ok": True, **out}
+
+
+@router.get("/agent/projects/{project}/galleries/{slug}/verdicts")
+async def gallery_verdicts_export(project: str, slug: str, host: HostRow = Depends(require_agent)):
+    """Read-only, with an agent token: the review, for a training pipeline (tools/gallery_verdicts.py)."""
+    name, verdicts = await run_in_threadpool(current_verdicts, project, slug)
+    return {"project": project, "set": name, "slug": slug, "exported_at": _iso(time.time()),
+            "verdicts": [{**v, "at": _iso(v["at"])} for v in verdicts]}

@@ -58,7 +58,7 @@ def files_under(root: Path) -> set:
     return {str(p.relative_to(root)) for p in root.rglob("*")} if root.exists() else set()
 
 
-def test_push_list_and_serve(agent, client):
+def test_push_list_and_serve(agent, tunnel):
     """Gallery: a pushed set is listed (slug, name, kind, items, labels, host, bytes), its index serves without the
     pusher's image_root, its images serve with an image type, private caching and nosniff, and a thumbnail falls back
     to the full image when the set has none."""
@@ -69,45 +69,45 @@ def test_push_list_and_serve(agent, client):
     assert r.status_code == 200, r.text
     assert r.json()["slug"] == "synthetic__cup__a" and r.json()["items"] == 2
 
-    sets = client.get(f"/api/v1/projects/{p}/galleries").json()["galleries"]
+    sets = tunnel.get(f"/api/v1/projects/{p}/galleries").json()["galleries"]
     assert [(s["slug"], s["set"], s["kind"], s["items"], s["labels"], s["host"]) for s in sets] == \
         [("synthetic__cup__a", "synthetic/cup/a", "synthetic", 2, ["cup"], agent.host_row.name)]
     assert sets[0]["bytes"] > 0 and sets[0]["pushed_at"] > 0 and sets[0]["thumbs"] is False
 
-    doc = client.get(f"/api/v1/projects/{p}/galleries/synthetic__cup__a").json()
+    doc = tunnel.get(f"/api/v1/projects/{p}/galleries/synthetic__cup__a").json()
     assert "image_root" not in doc and doc["set"] == "synthetic/cup/a"
     assert doc["items"][0]["boxes"] == [{"label": "cup", "score": 0.41, "bbox": [10, 20, 100, 80]}]
 
-    img = client.get(f"/api/v1/projects/{p}/galleries/synthetic__cup__a/image/sub/000002.png")
+    img = tunnel.get(f"/api/v1/projects/{p}/galleries/synthetic__cup__a/image/sub/000002.png")
     assert img.status_code == 200 and img.content == PNG + b"sub/000002.png"
     assert img.headers["content-type"] == "image/png"
     assert img.headers["cache-control"] == "private, max-age=3600" and img.headers["x-content-type-options"] == "nosniff"
-    th = client.get(f"/api/v1/projects/{p}/galleries/synthetic__cup__a/thumb/000001.png")
+    th = tunnel.get(f"/api/v1/projects/{p}/galleries/synthetic__cup__a/thumb/000001.png")
     assert th.status_code == 200 and th.content == PNG + b"000001.png"
 
-    projects = {x["project"]: x for x in client.get("/api/v1/projects").json()["projects"]}
+    projects = {x["project"]: x for x in tunnel.get("/api/v1/projects").json()["projects"]}
     assert projects[p]["galleries"] == 1 and projects[p]["pushes"] == 0
 
 
-def test_thumbnails_served(agent, client):
+def test_thumbnails_served(agent, tunnel):
     """Gallery: a set pushed with thumbnails serves thumbs/<file>.jpg as image/jpeg on the thumb route."""
     p = proj()
     assert push(agent, p, make_zip(p, thumbs=True)).status_code == 200
-    th = client.get(f"/api/v1/projects/{p}/galleries/synthetic__cup__a/thumb/000001.png")
+    th = tunnel.get(f"/api/v1/projects/{p}/galleries/synthetic__cup__a/thumb/000001.png")
     assert th.status_code == 200 and th.content == b"thumb:000001.png" and th.headers["content-type"] == "image/jpeg"
 
 
-def test_repush_replaces(agent, client):
+def test_repush_replaces(agent, tunnel):
     """Gallery: re-pushing the same set replaces it whole: the new items only, the old images gone, one set listed,
     and no temp directories left behind."""
     p = proj()
     assert push(agent, p, make_zip(p)).status_code == 200
     r = push(agent, p, make_zip(p, items=[item("new.jpg", width=64, height=64)]))
     assert r.status_code == 200, r.text
-    sets = client.get(f"/api/v1/projects/{p}/galleries").json()["galleries"]
+    sets = tunnel.get(f"/api/v1/projects/{p}/galleries").json()["galleries"]
     assert len(sets) == 1 and sets[0]["items"] == 1
-    assert [i["file"] for i in client.get(f"/api/v1/projects/{p}/galleries/{sets[0]['slug']}").json()["items"]] == ["new.jpg"]
-    assert client.get(f"/api/v1/projects/{p}/galleries/{sets[0]['slug']}/image/000001.png").status_code == 404
+    assert [i["file"] for i in tunnel.get(f"/api/v1/projects/{p}/galleries/{sets[0]['slug']}").json()["items"]] == ["new.jpg"]
+    assert tunnel.get(f"/api/v1/projects/{p}/galleries/{sets[0]['slug']}/image/000001.png").status_code == 404
     assert not [n for n in (rg.gallery_root() / p).iterdir() if n.name.startswith(".")]
 
 
@@ -122,7 +122,7 @@ def _symlink(name, target=b"/etc/passwd"):
     ("../x.jpg", PNG), ("/abs.jpg", PNG), ("images/../../x.jpg", PNG), ("images/a/../../../x.jpg", PNG),
     ("images\\..\\x.jpg", PNG), _symlink("images/link.jpg"), _symlink("images/sub"),
 ], ids=["dotdot", "absolute", "images-dotdot", "nested-dotdot", "backslash", "symlink", "symlink-dir"])
-def test_unsafe_entries_refused(agent, client, entry):
+def test_unsafe_entries_refused(agent, tunnel, entry):
     """Gallery: a zip with a "..", an absolute path, a backslash path or a symlink is refused with a 4xx, and nothing
     is written anywhere (not outside the set, not the set itself)."""
     p = proj()
@@ -130,19 +130,19 @@ def test_unsafe_entries_refused(agent, client, entry):
     before = files_under(root)
     r = push(agent, p, make_zip(p, entries=[entry]))
     assert 400 <= r.status_code < 500, r.text
-    assert client.get(f"/api/v1/projects/{p}/galleries").json()["galleries"] == []
+    assert tunnel.get(f"/api/v1/projects/{p}/galleries").json()["galleries"] == []
     new = {f for f in files_under(root) - before if not f.endswith(("monitor.db-wal", "monitor.db-shm"))}
     assert new <= {"galleries", f"galleries/{p}", "galleries/.incoming"}, new
     assert not list(root.rglob("x.jpg")) and not list(root.rglob("abs.jpg"))
 
 
 @pytest.mark.parametrize("entry", [("images/notes.txt", b"hi"), ("readme.txt", b"hi"), ("images/a.svg", b"<svg/>"), ("thumbs/a.html", b"<b>")])
-def test_non_image_refused(agent, client, entry):
+def test_non_image_refused(agent, tunnel, entry):
     """Gallery: an entry that is not index.json or an image (.jpg .jpeg .png .webp) under images/ or thumbs/ is a 422."""
     p = proj()
     r = push(agent, p, make_zip(p, entries=[entry]))
     assert r.status_code == 422, r.text
-    assert client.get(f"/api/v1/projects/{p}/galleries").json()["galleries"] == []
+    assert tunnel.get(f"/api/v1/projects/{p}/galleries").json()["galleries"] == []
 
 
 def test_caps(agent, monkeypatch):
@@ -179,13 +179,13 @@ def test_index_must_match_files(agent):
     assert push(agent, p, make_zip(p, items=[item("a.png", width=0)])).status_code == 422
 
 
-def test_restricted_host_refused(agent, client):
+def test_restricted_host_refused(agent, tunnel):
     """Gallery: a data-use-restricted host may not push a gallery (raw images): 403, nothing stored."""
     report_policy(agent, {"max_mode": "plan", "actions": True, "jobs": True, "transcript": "off", "snippets": False})
     p = proj()
     r = push(agent, p, make_zip(p))
     assert r.status_code == 403 and "data-use" in r.json()["detail"]
-    assert client.get(f"/api/v1/projects/{p}/galleries").json()["galleries"] == []
+    assert tunnel.get(f"/api/v1/projects/{p}/galleries").json()["galleries"] == []
 
 
 def test_delete_needs_operator(agent, client, tunnel):
@@ -194,33 +194,33 @@ def test_delete_needs_operator(agent, client, tunnel):
     assert push(agent, p, make_zip(p)).status_code == 200
     url = f"/api/v1/projects/{p}/galleries/synthetic__cup__a"
     assert client.delete(url, headers=WRITE).status_code == 403
-    assert client.get(url).status_code == 200
+    assert tunnel.get(url).status_code == 200
     assert tunnel.delete(url, headers=WRITE).status_code == 200
-    assert client.get(url).status_code == 404
-    assert client.get(f"/api/v1/projects/{p}/galleries").json()["galleries"] == []
+    assert tunnel.get(url).status_code == 404
+    assert tunnel.get(f"/api/v1/projects/{p}/galleries").json()["galleries"] == []
 
 
 @pytest.mark.parametrize("path", [
     "image/..%2Findex.json", "image/..%2Fmeta.json", "image/..%2F..%2F..%2Fmonitor.db", "image/%2Fetc%2Fpasswd",
     "thumb/..%2Findex.json", "thumb/..%2F..%2F..%2Fmonitor.db", "image/nope.png", "image/sub",
 ])
-def test_image_route_traversal(agent, client, path):
+def test_image_route_traversal(agent, tunnel, path):
     """Gallery: the image and thumb routes resolve the path and refuse anything outside the set's images/ (or thumbs/)
     with 404: "..", absolute paths, directories, missing files."""
     p = proj()
     assert push(agent, p, make_zip(p)).status_code == 200
-    r = client.get(f"/api/v1/projects/{p}/galleries/synthetic__cup__a/{path}")
+    r = tunnel.get(f"/api/v1/projects/{p}/galleries/synthetic__cup__a/{path}")
     assert r.status_code == 404, (r.status_code, r.content[:80])
 
 
-def test_bad_slug_404(client):
+def test_bad_slug_404(tunnel):
     """Gallery: a slug that could name a temp or parent directory is a 404."""
     p = proj()
     for slug in ("..", ".incoming", ".tmp-x"):
-        assert client.get(f"/api/v1/projects/{p}/galleries/{slug}").status_code in (404, 405)
+        assert tunnel.get(f"/api/v1/projects/{p}/galleries/{slug}").status_code in (404, 405)
 
 
-def test_pusher_dry_run(tmp_path, agent, client):
+def test_pusher_dry_run(tmp_path, agent, tunnel):
     """Gallery: tools/gallery_push.py --dry-run builds a zip (index without image_root, images/<file>) from a temp
     agent.conf, uploads nothing, and that zip is one the hub accepts."""
     p = proj()
@@ -244,7 +244,7 @@ def test_pusher_dry_run(tmp_path, agent, client):
     assert {"index.json", "images/a.png", "images/sub/b.jpg"} <= names
     assert "image_root" not in sent
     assert push(agent, p, out.read_bytes()).status_code == 200
-    assert client.get(f"/api/v1/projects/{p}/galleries/real__cup/image/sub/b.jpg").content == PNG
+    assert tunnel.get(f"/api/v1/projects/{p}/galleries/real__cup/image/sub/b.jpg").content == PNG
 
 
 def test_pusher_refuses_escape(tmp_path):
@@ -267,7 +267,7 @@ def test_ui_js():
     src = (STATIC / "research.js").read_text()
     assert 'class: "gal-ovl", viewBox: `0 0 ${W} ${H}`' in src
     assert 'type: "range", min: "0", max: "1"' in src
-    assert "boxOverlay(index.items[j], f.thr, colorOf)" in src and "IntersectionObserver" in src and "CHUNK = 120" in src
+    assert "boxOverlay(it, f.thr, colorOf, false, vOf)" in src and "IntersectionObserver" in src and "CHUNK = 120" in src
     assert 'e.key === "Escape"' in src and 'e.key === "ArrowLeft"' in src and "guard(h(\"button\"" in src
     js = """
 import { filterItems, boxesAbove, galleryUrl, NO_BOX } from %s;

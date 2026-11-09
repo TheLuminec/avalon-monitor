@@ -555,10 +555,11 @@ async def live(ws: WebSocket):
         await ws.close(code=4403)
         return
     try:
-        authz.viewer(ws.headers, ws.cookies, ip)
+        ident = authz.viewer(ws.headers, ws.cookies, ip)
     except AuthError:
         await ws.close(code=4401)
         return
+    ws.state.avm_login = ident.method == "access"   # gets login-only broadcasts (galleries)
     await ws.accept()
     hub.clients.add(ws)
     try:

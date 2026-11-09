@@ -33,12 +33,16 @@ class LiveHub:
         self.clients: set[WebSocket] = set()
         self.online: dict[int, bool] = {}
 
-    async def broadcast(self, message: dict) -> None:
+    async def broadcast(self, message: dict, login_only: bool = False) -> None:
+        """login_only: only to sockets opened with a Cloudflare Access login (gallery events name sets, files and
+        reviewers, which trusted-network viewers may not see; see require_login)."""
         if not self.clients:
             return
         data = json.dumps(message, separators=(",", ":"))
         dead = []
         for ws in list(self.clients):
+            if login_only and not getattr(getattr(ws, "state", None), "avm_login", False):
+                continue
             try:
                 await ws.send_text(data)
             except Exception:
@@ -133,6 +137,20 @@ def require_viewer(request: Request) -> Identity:
         return authz.viewer(request.headers, request.cookies, client_ip(request))
     except AuthError as e:
         raise HTTPException(e.status, e.detail)
+
+
+def login_note() -> str:
+    where = settings.public_url or "the public dashboard address"
+    return f"image galleries need a login: open this page through {where}"
+
+
+def require_login(request: Request) -> Identity:
+    """Like require_viewer, but only for a Cloudflare Access identity: trusted-network viewers (anonymous tailnet/LAN
+    reads) are refused. Used by every gallery read: a gallery is raw images, shown to signed-in people only."""
+    ident = require_viewer(request)
+    if ident.method != "access":
+        raise HTTPException(403, login_note())
+    return ident
 
 
 _HOSTNAME = socket.gethostname().lower()

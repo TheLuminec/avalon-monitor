@@ -1,7 +1,7 @@
 // Research results pages: renders the latest document a project pushed with `avm results push`
 // (schema "<name>-results/<n>") and per-metric history across pushes. Everything is rendered as
 // text/SVG from the pushed document only - nothing is ever fetched from the project itself.
-import { $, h, fmt, state, api, post, guard, on, navigate, toast } from "./core.js?v=1.15.0";
+import { $, h, fmt, state, api, post, guard, on, navigate, toast, canChange, roTip } from "./core.js?v=1.15.0";
 
 const NS = "http://www.w3.org/2000/svg";
 function s(tag, attrs = {}, ...kids) {
@@ -506,40 +506,109 @@ function dotbarFigure(fig, colors) {
 // from the hub's copy of what was pushed. 2,000+ items stay smooth: tiles are built CHUNK at a time as the
 // grid scrolls (IntersectionObserver on a sentinel, plus a "show more" button), and a tile is built once and
 // kept; a threshold change only redraws the overlays of the tiles shown.
+// Galleries are login-only (the hub refuses trusted-network viewers): signed out, the page says so and fetches nothing.
+// Per-box review: a box with an "id" can be marked by an operator, in the grid and in the full-size view: left-click
+// inside a box = good, right-click = bad; the same click again clears it, the other one flips it. The smallest drawn
+// box under the pointer is the one meant. Reviewed boxes are always drawn (green ✓ / red ✗), whatever the slider says.
 const CHUNK = 120;
 const encPath = (f) => String(f).split("/").map(encodeURIComponent).join("/");
 export const galleryUrl = (project, slug, kind, file) => `/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(slug)}/${kind}/${encPath(file)}`;
 export const boxesAbove = (item, thr) => (Array.isArray(item?.boxes) ? item.boxes : []).filter((b) => num(b?.score) != null && b.score >= thr);
 const keptOf = (item) => (item?.tags && typeof item.tags.kept === "boolean" ? item.tags.kept : null);
 const fScore = (v) => (num(v) == null ? "—" : v.toFixed(2));
+const bboxOf = (b) => (Array.isArray(b?.bbox) && b.bbox.length === 4 && b.bbox.every((v) => num(v) != null) ? b.bbox : null);
+const noVerdict = () => null;
 export const NO_BOX = Symbol("no box");   // never a label (a label can be any string)
+export const signedIn = () => state.config?.user?.method === "access";
+export const VERDICT_MARK = { good: "✓", bad: "✗" };
+
+/** The key of one box's verdict (file names have no control characters, so "\n" can't occur in one). */
+export const vKey = (file, id) => `${file}\n${id}`;
+/** What a click does to a box's verdict: the same verdict again clears it, the other one replaces it. */
+export const nextVerdict = (current, clicked) => (current === clicked ? null : clicked);
+
+/** The boxes drawn for an item: those scoring at/above the threshold, plus every reviewed box whatever its score
+ *  (slider-independent: a verdict must never hide). vOf(file, id) -> "good" | "bad" | null. */
+export function drawnBoxes(item, thr, vOf = noVerdict) {
+  return (Array.isArray(item?.boxes) ? item.boxes : [])
+    .filter((b) => (num(b?.score) != null && b.score >= thr) || (typeof b?.id === "string" && vOf(item.file, b.id) != null));
+}
+
+/** A client point -> image pixel space, from the overlay's on-screen rect and its "xMidYMid meet" scale (the image
+ *  is letterboxed inside the rect). null outside the image itself. */
+export function toImagePx(rect, W, H, clientX, clientY) {
+  const k = Math.min(rect.width / W, rect.height / H);
+  if (!(k > 0)) return null;
+  const x = (clientX - rect.left - (rect.width - W * k) / 2) / k, y = (clientY - rect.top - (rect.height - H * k) / 2) / k;
+  return x >= 0 && y >= 0 && x <= W && y <= H ? [x, y] : null;
+}
+
+/** The smallest box (by area) containing image point (x, y), among `boxes` that have an id; null if none. */
+export function hitBox(boxes, x, y) {
+  let best = null, area = Infinity;
+  for (const b of boxes) {
+    const bb = bboxOf(b);
+    if (!bb || typeof b.id !== "string") continue;
+    const [bx, by, w, bh] = bb, a = Math.max(0, w) * Math.max(0, bh);
+    if (x >= bx && x <= bx + w && y >= by && y <= by + bh && a < area) { best = b; area = a; }
+  }
+  return best;
+}
+
+/** One item's review: n boxes with an id, how many reviewed, good, bad. */
+export function reviewOf(item, vOf = noVerdict) {
+  const r = { n: 0, reviewed: 0, good: 0, bad: 0 };
+  for (const b of Array.isArray(item?.boxes) ? item.boxes : []) {
+    if (typeof b?.id !== "string") continue;
+    r.n++;
+    const v = vOf(item.file, b.id);
+    if (v === "good" || v === "bad") { r.reviewed++; r[v]++; }
+  }
+  return r;
+}
+export function reviewCounts(items, vOf = noVerdict) {
+  const t = { n: 0, reviewed: 0, good: 0, bad: 0 };
+  for (const it of items) { const r = reviewOf(it, vOf); for (const k in t) t[k] += r[k]; }
+  return t;
+}
 
 /** Items passing the filters: label ("" any, NO_BOX = no box at/above the threshold, else a box with that label
- *  at/above it), session ("" any), kept ("" any, "kept", "dropped"; from tags.kept). */
+ *  at/above it), session ("" any), kept ("" any, "kept", "dropped"; from tags.kept), review ("" any, "unreviewed" =
+ *  a box with an id has no verdict, "bad" = a box marked bad, "done" = has boxes with ids and all are reviewed;
+ *  verdicts from f.vOf). */
 export function filterItems(items, f) {
+  const vOf = f.vOf || noVerdict;
   return items.filter((it) => {
     if (f.session !== "" && String(it.session ?? "") !== f.session) return false;
     if (f.kept === "kept" && keptOf(it) !== true) return false;
     if (f.kept === "dropped" && keptOf(it) !== false) return false;
-    if (f.label === "") return true;
+    if (f.review) {
+      const r = reviewOf(it, vOf);
+      if (f.review === "unreviewed" && r.reviewed >= r.n) return false;
+      if (f.review === "bad" && !r.bad) return false;
+      if (f.review === "done" && (!r.n || r.reviewed < r.n)) return false;
+    }
+    if (f.label === "" || f.label == null) return true;
     const above = boxesAbove(it, f.thr);
     return f.label === NO_BOX ? above.length === 0 : above.some((b) => b.label === f.label);
   });
 }
 
 /** One item's boxes as an SVG in the image's own pixel space (viewBox = width x height, top-left origin), laid over
- *  the image and scaled with it; boxes scoring below `thr` are left out. `big` = the full-size view (smaller labels). */
-export function boxOverlay(item, thr, colorOf, big = false) {
+ *  the image and scaled with it; boxes scoring below `thr` are left out unless reviewed (drawnBoxes). A reviewed box
+ *  is green with ✓ (good) or red with ✗ (bad): colour and mark, never colour alone. `big` = the full-size view. */
+export function boxOverlay(item, thr, colorOf, big = false, vOf = noVerdict) {
   const W = item.width, H = item.height;
   const g = s("svg", { class: "gal-ovl", viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "xMidYMid meet", "aria-hidden": "true" });
   const fs = Math.max(W, H) / (big ? 40 : 16);
-  for (const b of boxesAbove(item, thr)) {
-    const bb = Array.isArray(b.bbox) && b.bbox.length === 4 && b.bbox.every((v) => num(v) != null) ? b.bbox : null;
+  for (const b of drawnBoxes(item, thr, vOf)) {
+    const bb = bboxOf(b);
     if (!bb) continue;
     const [x, y, w, bh] = bb;
-    const col = colorOf(b.label);
-    g.append(s("rect", { x, y, width: Math.max(0, w), height: Math.max(0, bh), class: "gal-box", style: `--bc:${col}` }));
-    const text = `${b.label} ${fScore(b.score)}`;
+    const v = typeof b.id === "string" ? vOf(item.file, b.id) : null;
+    const col = v === "good" ? "var(--c-green)" : v === "bad" ? "var(--c-red)" : colorOf(b.label);
+    g.append(s("rect", { x, y, width: Math.max(0, w), height: Math.max(0, bh), class: "gal-box" + (v ? " gal-" + v : ""), style: `--bc:${col}` }));
+    const text = `${v ? VERDICT_MARK[v] + " " : ""}${b.label} ${fScore(b.score)}`;
     const ty = y > fs * 1.2 ? y - fs * 0.3 : y + fs;   // above the box, or inside it at the top edge
     const right = x + text.length * fs * 0.62 > W;      // would run off the right edge: end it at the box's right side
     g.append(s("text", { x: right ? Math.min(W, x + w) - fs * 0.15 : x + fs * 0.15, y: ty, "text-anchor": right ? "end" : null,
@@ -550,9 +619,9 @@ export function boxOverlay(item, thr, colorOf, big = false) {
 
 // Full-size view of list[start]: the image with its boxes and every detail. Esc closes, arrow keys step.
 function galleryModal(ctx, list, start) {
-  let i = start;
+  let i = start, fig = null, boxesEl = null;
   const body = h("div", { class: "gal-modal-body" });
-  const close = () => { document.removeEventListener("keydown", onKey); wrap.remove(); };
+  const close = () => { document.removeEventListener("keydown", onKey); ctx.listeners.delete(paint); wrap.remove(); };
   const go = (d) => { if (list.length) { i = (i + d + list.length) % list.length; draw(); } };
   const onKey = (e) => {
     if (e.key === "Escape") { e.preventDefault(); close(); }
@@ -560,13 +629,37 @@ function galleryModal(ctx, list, start) {
     else if (e.key === "ArrowRight") { e.preventDefault(); go(1); }
   };
   const row = (k, v) => h("tr", {}, h("th", {}, k), h("td", {}, v == null || v === "" ? "—" : String(v)));
-  const KNOWN = ["file", "width", "height", "text", "seed", "session", "tags", "boxes", "_i"];
-  function draw() {
+  const KNOWN = ["file", "width", "height", "text", "seed", "session", "tags", "boxes", "_i", "_vrev"];
+  function paint() {   // the overlay and the box table: redrawn on every verdict change, the image is kept
     const it = list[i], thr = ctx.thr();
-    const fig = h("div", { class: "gal-full", style: `aspect-ratio:${it.width} / ${it.height}` },
-      h("img", { src: galleryUrl(ctx.project, ctx.slug(), "image", it.file), alt: it.file, decoding: "async" }),
-      boxOverlay(it, thr, ctx.colorOf, true));
+    fig.querySelector(".gal-ovl")?.remove();
+    fig.append(boxOverlay(it, thr, ctx.colorOf, true, ctx.vOf));
     const boxes = (it.boxes || []).slice().sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    const r = reviewOf(it, ctx.vOf);
+    boxesEl.replaceChildren(
+      h("h4", {}, `Boxes (${boxes.length}; dimmed = below ${thr.toFixed(2)}${r.n ? `; reviewed ${r.reviewed} / ${r.n}` : ""})`),
+      boxes.length ? h("table", { class: "gal-kv gal-boxes" },
+        h("thead", {}, h("tr", {}, h("th", {}, "label"), h("th", { class: "r" }, "score"), h("th", {}, "bbox [x, y, w, h]"), h("th", {}, "review"))),
+        h("tbody", {}, boxes.map((b) => {
+          const v = typeof b.id === "string" ? ctx.vOf(it.file, b.id) : null;
+          return h("tr", { class: (num(b.score) != null && b.score >= thr) || v ? "" : "below" },
+            h("td", {}, h("i", { class: "lg-sw", style: `background:${ctx.colorOf(b.label)}` }), " ", b.label),
+            h("td", { class: "r num" }, fScore(b.score)),
+            h("td", { class: "num" }, Array.isArray(b.bbox) ? b.bbox.map((x) => (num(x) == null ? "?" : +x.toFixed(1))).join(", ") : "—"),
+            h("td", { class: v ? "gal-v-" + v : "muted", title: typeof b.id === "string" ? `box id ${b.id}` : "no id: can't be reviewed" },
+              v ? `${VERDICT_MARK[v]} ${v}` : typeof b.id === "string" ? "—" : "n/a"));
+        })))
+        : h("div", { class: "muted" }, "no boxes"),
+      r.n ? h("div", { class: "muted gal-hint" }, canChange() ? "Click inside a box: good · right-click: bad · the same click again clears it."
+        : "Sign in to review boxes.") : null);
+  }
+  function draw() {
+    const it = list[i];
+    fig = h("div", { class: "gal-full", style: `aspect-ratio:${it.width} / ${it.height}` },
+      h("img", { src: galleryUrl(ctx.project, ctx.slug(), "image", it.file), alt: it.file, decoding: "async" }));
+    fig.addEventListener("click", (e) => ctx.review(e, it, fig, "good", true));
+    fig.addEventListener("contextmenu", (e) => ctx.review(e, it, fig, "bad", true));
+    boxesEl = h("div", {});
     body.replaceChildren(
       h("div", { class: "gal-full-wrap" }, fig),
       h("div", { class: "gal-detail" },
@@ -579,31 +672,45 @@ function galleryModal(ctx, list, start) {
           row("file", it.file), row("size", `${it.width} × ${it.height}`), row("text", it.text), row("seed", it.seed), row("session", it.session),
           ...Object.entries(it.tags || {}).map(([k, v]) => row(`tags.${k}`, v)),
           ...Object.entries(it).filter(([k]) => !KNOWN.includes(k)).map(([k, v]) => row(k, v)))),
-        h("h4", {}, `Boxes (${boxes.length}; dimmed = below ${thr.toFixed(2)})`),
-        boxes.length ? h("table", { class: "gal-kv gal-boxes" },
-          h("thead", {}, h("tr", {}, h("th", {}, "label"), h("th", { class: "r" }, "score"), h("th", {}, "bbox [x, y, w, h]"))),
-          h("tbody", {}, boxes.map((b) => h("tr", { class: num(b.score) != null && b.score >= thr ? "" : "below" },
-            h("td", {}, h("i", { class: "lg-sw", style: `background:${ctx.colorOf(b.label)}` }), " ", b.label),
-            h("td", { class: "r num" }, fScore(b.score)),
-            h("td", { class: "num" }, Array.isArray(b.bbox) ? b.bbox.map((v) => (num(v) == null ? "?" : +v.toFixed(1))).join(", ") : "—")))))
-          : h("div", { class: "muted" }, "no boxes")));
+        boxesEl));
+    paint();
   }
   const wrap = h("div", { class: "gal-modal", role: "dialog", "aria-modal": "true", onclick: (e) => { if (e.target === wrap) close(); } }, body);
   document.addEventListener("keydown", onKey);
+  ctx.listeners.add(paint);
   document.body.append(wrap);
   draw();
 }
 
+/** The Gallery card when there is nothing to browse: signed out (galleries need a login) or no sets pushed. */
+export function galleryNote(project, sets) {
+  const pub = state.config?.public_url;
+  const text = !signedIn()
+    ? h("span", {}, "Image galleries need a login: open this page through ",
+        pub ? h("a", { href: `${pub.replace(/\/$/, "")}/#/research/${encodeURIComponent(project)}`, class: "ro-link" }, pub.replace(/^[a-z]+:\/\//i, "").replace(/\/.*$/, ""))
+          : "the public dashboard address", ".")
+    : sets.length ? null : "No image sets pushed yet (tools/gallery_push.py).";
+  if (!text) return null;
+  return h("div", { class: "card table-card gallery gal-empty" }, h("div", { class: "fig-head" }, h("h3", {}, "Gallery")), h("div", { class: "muted" }, text));
+}
+
+/** The Gallery section of a project's research page: always there; the browser when signed in with sets, else a note. */
+export const galleryCard = (project, sets) => galleryNote(project, sets) || gallerySection(project, sets);
+
 function gallerySection(project, sets) {
   const root = h("div", { class: "card table-card gallery" });
   const kinds = [...new Set(sets.map((x) => x.kind).filter(Boolean))];
-  const f = { kind: "", slug: sets[0].slug, label: "", session: "", kept: "", thr: 0 };
-  let index = null, colors = new Map(), shown = [], tiles = new Map(), upto = 0, raf = 0, loadSeq = 0, labelOpts = [""];
+  let verdicts = new Map();   // vKey(file, id) -> {verdict, at, by}: the current index's only (the hub filters)
+  const vOf = (file, id) => verdicts.get(vKey(file, id))?.verdict ?? null;
+  const f = { kind: "", slug: sets[0].slug, label: "", session: "", kept: "", review: "", thr: 0, vOf };
+  let index = null, colors = new Map(), shown = [], tiles = new Map(), upto = 0, raf = 0, loadSeq = 0, labelOpts = [""], byFile = new Map();
+  const pending = new Map();   // vKey -> sequence number of the PUT in flight for it (a newer click wins)
+  let vSeq = 0;
   const colorOf = (lab) => {
     if (!colors.has(lab)) colors.set(lab, `var(${SERIES[colors.size % SERIES.length]})`);
     return colors.get(lab);
   };
-  const ctx = { project, slug: () => f.slug, thr: () => f.thr, colorOf };
+  const ctx = { project, slug: () => f.slug, thr: () => f.thr, colorOf, vOf, review, listeners: new Set() };
 
   const opt = (v, label, sel = false) => h("option", { value: v, selected: sel ? "" : null }, label);
   const setSel = h("select", { title: "Image set" });
@@ -611,15 +718,72 @@ function gallerySection(project, sets) {
   const labelSel = h("select", { title: "Label: items with a box of it at or above the threshold" });
   const sessSel = h("select", { title: "Session" });
   const keptSel = h("select", { title: "Kept / dropped (tags.kept)" }, opt("", "kept + dropped", true), opt("kept", "kept"), opt("dropped", "dropped"));
+  const reviewSel = h("select", { title: "Review: per-box verdicts (boxes with an id)" }, opt("", "all (review)", true),
+    opt("unreviewed", "has unreviewed boxes"), opt("bad", "has bad boxes"), opt("done", "fully reviewed"));
   const thrVal = h("span", { class: "num gal-thr-val" }, "0.00");
   const slider = h("input", { type: "range", min: "0", max: "1", step: "0.01", value: "0", class: "gal-thr", "aria-label": "score threshold" });
   const counts = h("div", { class: "gal-counts muted" });
+  const reviewLine = h("div", { class: "gal-counts gal-review muted" });
   const meta = h("div", { class: "research-meta gal-meta" });
   const grid = h("div", { class: "gal-grid" });
   const more = h("button", { class: "btn small gal-more", hidden: "" }, "show more");
   const sentinel = h("div", { class: "gal-sentinel" });
-  const delBtn = guard(h("button", { class: "btn small danger", title: "Delete this set from the hub" }, "Delete set"));
+  const delBtn = guard(h("button", { class: "btn small danger", title: "Delete this set from the hub (and its review)" }, "Delete set"));
   kindSel.hidden = kinds.length < 2;
+
+  // ---- review: hit-test a click in image pixel space, toggle, PUT optimistically, roll back on error
+  let roToast = 0;
+  function review(e, it, el, which, inModal) {
+    const svg = el.querySelector(".gal-ovl");
+    const p = svg && toImagePx(svg.getBoundingClientRect(), it.width, it.height, e.clientX, e.clientY);
+    if (!p) return false;   // outside the image: the usual behaviour (and the browser's own context menu)
+    if (!canChange()) {     // read-only viewer: verdicts are shown, clicks change nothing; no context-menu suppression
+      if (which !== "good" || !hitBox(drawnBoxes(it, f.thr, vOf), p[0], p[1])) return false;
+      if (inModal && Date.now() - roToast > 4000) { roToast = Date.now(); toast(`Sign in to review boxes (${roTip()})`); }
+      return inModal;
+    }
+    if (which === "bad") e.preventDefault();   // over the image only
+    const b = hitBox(drawnBoxes(it, f.thr, vOf), p[0], p[1]);
+    if (!b) return false;
+    e.preventDefault(); e.stopPropagation();
+    setVerdict(it, b.id, nextVerdict(vOf(it.file, b.id), which));
+    return true;
+  }
+  function apply(it, id, rec) {   // one box's verdict changed: the tile, the counts and an open full-size view follow
+    const k = vKey(it.file, id);
+    if (rec) verdicts.set(k, rec); else verdicts.delete(k);
+    it._vrev = (it._vrev || 0) + 1;
+    const t = tiles.get(it._i);
+    if (t) tileFor(it._i);
+    updateReview();
+    for (const fn of ctx.listeners) fn();
+  }
+  function setVerdict(it, id, verdict) {
+    const k = vKey(it.file, id), prev = verdicts.get(k) || null, mine = ++vSeq, slug = f.slug;
+    pending.set(k, mine);
+    apply(it, id, verdict ? { verdict, at: Date.now() / 1000, by: state.config?.user?.subject ?? null } : null);
+    post(`/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(slug)}/verdicts`, { file: it.file, box_id: id, verdict }, "PUT")
+      .then((r) => { if (pending.get(k) === mine && slug === f.slug) { pending.delete(k); apply(it, id, r.verdict ? { verdict: r.verdict, at: r.at, by: r.by } : null); } })
+      .catch((err) => {
+        if (pending.get(k) === mine && slug === f.slug) { pending.delete(k); apply(it, id, prev); }   // roll back
+        toast(`Review not saved: ${err.message}`, true);
+      });
+  }
+  function updateReview() {
+    if (!index) return;
+    const c = reviewCounts(index.items, vOf);
+    reviewSel.hidden = !c.n;
+    reviewLine.textContent = c.n ? `reviewed ${c.reviewed} / ${c.n} boxes (good ${c.good}, bad ${c.bad})` : "no box ids in this set: it can't be reviewed";
+  }
+  // live: another operator's (or this page's own) verdicts
+  const off = on("gallery_verdict", (m) => {
+    if (!root.isConnected) { off(); return; }   // the page was re-rendered or left (the section is appended in the same tick it is built)
+    if (m.project !== project || m.slug !== f.slug || !index) return;
+    const it = byFile.get(m.file);
+    if (!it || pending.has(vKey(m.file, m.box_id))) return;   // a click of ours is in flight: its answer settles it
+    if (!(it.boxes || []).some((b) => b.id === m.box_id)) return;
+    apply(it, m.box_id, m.verdict ? { verdict: m.verdict, at: m.at, by: m.by } : null);
+  });
 
   function fillSets() {
     const avail = sets.filter((x) => f.kind === "" || x.kind === f.kind);
@@ -628,16 +792,19 @@ function gallerySection(project, sets) {
   }
   function tileFor(j) {
     let t = tiles.get(j);
+    const it = index.items[j];
     if (!t) {
-      const it = index.items[j];
-      t = h("button", { class: "gal-tile", title: it.file, onclick: () => galleryModal(ctx, shown.map((k) => index.items[k]), shown.indexOf(j)) },
+      const reviewable = (it.boxes || []).some((b) => typeof b.id === "string");
+      t = h("button", { class: "gal-tile", title: it.file + (!reviewable ? "" : canChange() ? " · click a box: good · right-click: bad (again: clear)" : " · sign in to review boxes"),
+        onclick: (e) => { if (!review(e, it, t, "good", false)) galleryModal(ctx, shown.map((k) => index.items[k]), shown.indexOf(j)); } },
         h("img", { src: galleryUrl(project, f.slug, "thumb", it.file), alt: it.file, loading: "lazy", decoding: "async" }));
+      t.addEventListener("contextmenu", (e) => review(e, it, t, "bad", false));
       tiles.set(j, t);
     }
-    if (t._thr !== f.thr) {   // (re)draw the overlay for the current threshold
+    if (t._thr !== f.thr || t._vrev !== (it._vrev || 0)) {   // (re)draw the overlay for the threshold and verdicts
       t.querySelector(".gal-ovl")?.remove();
-      t.append(boxOverlay(index.items[j], f.thr, colorOf));
-      t._thr = f.thr;
+      t.append(boxOverlay(it, f.thr, colorOf, false, vOf));
+      t._thr = f.thr; t._vrev = it._vrev || 0;
     }
     return t;
   }
@@ -653,6 +820,7 @@ function gallerySection(project, sets) {
     let nBoxes = 0;
     for (const j of shown) nBoxes += boxesAbove(index.items[j], f.thr).length;
     counts.textContent = `showing ${shown.length} of ${index.items.length}, ${nBoxes} box${nBoxes === 1 ? "" : "es"} ≥ ${f.thr.toFixed(2)}`;
+    updateReview();
     grid.replaceChildren();
     upto = 0;
     while (upto < Math.min(want, shown.length)) renderMore();
@@ -663,16 +831,20 @@ function gallerySection(project, sets) {
     const seq = ++loadSeq;
     index = null;
     grid.replaceChildren(h("div", { class: "muted gal-none" }, "Loading…"));
-    let doc;
-    try { doc = await api(`/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(f.slug)}`); }
-    catch (e) { if (seq === loadSeq) grid.replaceChildren(h("div", { class: "muted gal-none" }, `Cannot load this set: ${e.message}`)); return; }
+    const base = `/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(f.slug)}`;
+    let doc, vs;
+    try {
+      [doc, vs] = await Promise.all([api(base), api(base + "/verdicts").catch((e) => { toast(`Cannot load the review: ${e.message}`, true); return { verdicts: [] }; })]);
+    } catch (e) { if (seq === loadSeq) grid.replaceChildren(h("div", { class: "muted gal-none" }, `Cannot load this set: ${e.message}`)); return; }
     if (seq !== loadSeq) return;   // another set was picked meanwhile
     doc.items = (Array.isArray(doc.items) ? doc.items : []).filter((it) => it && num(it.width) > 0 && num(it.height) > 0);
     doc.items.forEach((it, j) => { it._i = j; });
-    index = doc; tiles = new Map(); colors = new Map();
+    index = doc; tiles = new Map(); colors = new Map(); pending.clear();
+    byFile = new Map(doc.items.map((it) => [it.file, it]));
+    verdicts = new Map((vs?.verdicts || []).filter((v) => v.verdict === "good" || v.verdict === "bad").map((v) => [vKey(v.file, v.box_id), { verdict: v.verdict, at: v.at, by: v.by }]));
     for (const l of [...(doc.labels || []), ...doc.items.flatMap((it) => (it.boxes || []).map((b) => b.label))]) colorOf(l);
     const sessions = [...new Set(doc.items.map((it) => it.session).filter((v) => v != null).map(String))].sort();
-    f.label = ""; f.session = "";
+    f.label = ""; f.session = ""; f.review = ""; reviewSel.value = "";
     // option values index labelOpts (labels are arbitrary strings; NO_BOX is not a string at all)
     labelOpts = ["", ...colors.keys(), NO_BOX];
     labelSel.replaceChildren(...labelOpts.map((l, k) => opt(String(k), l === "" ? "any label" : l === NO_BOX ? "no box ≥ threshold" : l, k === 0)));
@@ -685,7 +857,8 @@ function gallerySection(project, sets) {
       h("span", {}, `${doc.items.length} items · ${fmt.bytes(m.bytes)}`),
       h("span", {}, `pushed ${m.pushed_at ? fmt.ago(Date.now() / 1000 - m.pushed_at) : "?"}${m.host ? " from " + m.host : ""}`),
       m.thumbs === false ? h("span", {}, "no thumbnails: tiles load full images") : null,
-      h("span", { class: "viz-legend" }, [...colors.keys()].map((l) => h("span", {}, h("i", { class: "lg-sw", style: `background:${colorOf(l)}` }), l))),
+      h("span", { class: "viz-legend" }, [...colors.keys()].map((l) => h("span", {}, h("i", { class: "lg-sw", style: `background:${colorOf(l)}` }), l)),
+        h("span", { class: "gal-v-good" }, `${VERDICT_MARK.good} good`), h("span", { class: "gal-v-bad" }, `${VERDICT_MARK.bad} bad`)),
     ].filter(Boolean));
     refresh();
   }
@@ -695,6 +868,7 @@ function gallerySection(project, sets) {
   labelSel.addEventListener("change", () => { f.label = labelOpts[Number(labelSel.value)] ?? ""; if (index) refresh(); });
   sessSel.addEventListener("change", () => { f.session = sessSel.value; if (index) refresh(); });
   keptSel.addEventListener("change", () => { f.kept = keptSel.value; if (index) refresh(); });
+  reviewSel.addEventListener("change", () => { f.review = reviewSel.value; if (index) refresh(); });
   slider.addEventListener("input", () => {
     f.thr = Number(slider.value) || 0; thrVal.textContent = f.thr.toFixed(2);
     cancelAnimationFrame(raf); raf = requestAnimationFrame(() => { if (index) refresh(true); });
@@ -702,7 +876,7 @@ function gallerySection(project, sets) {
   more.addEventListener("click", renderMore);
   delBtn.addEventListener("click", async () => {
     const m = sets.find((x) => x.slug === f.slug);
-    if (!m || !confirm(`Delete the image set "${m.set}" (${m.items} items) from the hub?`)) return;
+    if (!m || !confirm(`Delete the image set "${m.set}" (${m.items} items) and its review from the hub?`)) return;
     try { await post(`/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(m.slug)}`, undefined, "DELETE"); toast(`Deleted ${m.set}`); renderResearch({ project }); }
     catch (e) { toast(e.message, true); }
   });
@@ -716,10 +890,10 @@ function gallerySection(project, sets) {
 
   fillSets();
   root.append(
-    h("div", { class: "fig-head" }, h("h3", {}, "Gallery"), h("span", { class: "muted fig-cap" }, `${sets.length} image set${sets.length === 1 ? "" : "s"} · visible to every dashboard viewer`)),
-    h("div", { class: "gal-controls" }, setSel, kindSel, labelSel, sessSel, keptSel,
-      h("label", { class: "gal-thr-wrap", title: "Hide boxes scoring below this" }, "score ≥", slider, thrVal), delBtn),
-    meta, counts, grid, more, sentinel);
+    h("div", { class: "fig-head" }, h("h3", {}, "Gallery"), h("span", { class: "muted fig-cap" }, `${sets.length} image set${sets.length === 1 ? "" : "s"} · visible to signed-in dashboard viewers`)),
+    h("div", { class: "gal-controls" }, setSel, kindSel, labelSel, sessSel, keptSel, reviewSel,
+      h("label", { class: "gal-thr-wrap", title: "Hide boxes scoring below this (reviewed boxes always show)" }, "score ≥", slider, thrVal), delBtn),
+    meta, counts, reviewLine, grid, more, sentinel);
   loadSet();
   return root;
 }
@@ -742,12 +916,13 @@ export async function renderResearch(params = {}) {
   const pinfo = projects.find((p) => p.project === project) || {};
   const projSel = projects.length > 1 ? h("select", { onchange: (e) => navigate(`#/research/${e.target.value}`) },
     projects.map((p) => h("option", { value: p.project, selected: p.project === project ? "" : null }, p.project))) : null;
-  const galleries = pinfo.galleries ? api(`/api/v1/projects/${project}/galleries`).then((r) => r.galleries || []).catch(() => []) : Promise.resolve([]);
+  // galleries are login-only: signed out, nothing is fetched and the section says how to sign in
+  const galleries = signedIn() && pinfo.galleries ? api(`/api/v1/projects/${project}/galleries`).then((r) => r.galleries || []).catch(() => []) : Promise.resolve([]);
   if (!pinfo.pushes) {   // a project with image galleries only
     const sets = await galleries;
     if (state.view !== "research" || view.project !== project) return;
     app.append(h("div", { class: "page-head" }, h("h2", {}, "Research"), h("span", { class: "muted" }, project), h("div", { class: "filters" }, projSel)),
-      sets.length ? gallerySection(project, sets) : h("div", { class: "empty" }, "Nothing pushed for this project."));
+      galleryCard(project, sets));
     return;
   }
   let cur, hist, sets;
@@ -786,7 +961,7 @@ export async function renderResearch(params = {}) {
     notesEl,
     programmes(doc),
     figs.length ? h("div", { class: "research-figs" }, figs) : null,
-    sets.length ? gallerySection(project, sets) : null,
+    galleryCard(project, sets),
   ].filter(Boolean));
 }
 

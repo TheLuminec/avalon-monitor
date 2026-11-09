@@ -210,6 +210,20 @@ CREATE TABLE IF NOT EXISTS results (
 );
 CREATE INDEX IF NOT EXISTS results_project ON results(project, received);
 
+-- Per-box review of pushed gallery sets (routes_gallery.py): an operator marks a box good or bad. Keyed by the box's
+-- own id (stable across re-exports), so verdicts outlive re-pushes of the set; only deleting the set removes them.
+-- Readers only count verdicts whose (file, box_id) is in the set's current index; the others stay stored.
+CREATE TABLE IF NOT EXISTS gallery_verdicts (
+    project TEXT NOT NULL,
+    slug    TEXT NOT NULL,
+    file    TEXT NOT NULL,
+    box_id  TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('good', 'bad')),
+    at      REAL NOT NULL,
+    by      TEXT,
+    UNIQUE (project, slug, file, box_id)
+);
+
 -- Per-user dashboard preferences (layout, hidden panels, card order).
 CREATE TABLE IF NOT EXISTS prefs (
     user    TEXT PRIMARY KEY,
@@ -1094,6 +1108,32 @@ class Database:
         with self._lock:
             self._conn.execute("INSERT OR REPLACE INTO prefs(user, data, updated) VALUES (?,?,?)",
                                (user, json.dumps(data, separators=(",", ":")), time.time()))
+
+    # ---------------------------------------------------------------- gallery verdicts
+    def verdicts_list(self, project: str, slug: str) -> list[dict]:
+        """Every stored verdict of a set (orphans included: the caller filters by the current index)."""
+        with self._lock:
+            rows = self._conn.execute("SELECT file, box_id, verdict, at, by FROM gallery_verdicts WHERE project=? AND slug=?"
+                                      " ORDER BY file, box_id", (project, slug)).fetchall()
+        return [dict(r) for r in rows]
+
+    def verdict_set(self, project: str, slug: str, file: str, box_id: str, verdict: Optional[str], by: Optional[str],
+                    now: float | None = None) -> Optional[dict]:
+        """Set one box's verdict ('good' / 'bad'), or clear it (None). Returns the stored row, None when cleared."""
+        with self._lock:
+            if verdict is None:
+                self._conn.execute("DELETE FROM gallery_verdicts WHERE project=? AND slug=? AND file=? AND box_id=?",
+                                   (project, slug, file, box_id))
+                return None
+            at = time.time() if now is None else now
+            self._conn.execute("INSERT INTO gallery_verdicts(project, slug, file, box_id, verdict, at, by) VALUES (?,?,?,?,?,?,?)"
+                               " ON CONFLICT(project, slug, file, box_id) DO UPDATE SET verdict=excluded.verdict, at=excluded.at,"
+                               " by=excluded.by", (project, slug, file, box_id, verdict, at, by))
+        return {"file": file, "box_id": box_id, "verdict": verdict, "at": at, "by": by}
+
+    def verdicts_delete_set(self, project: str, slug: str) -> int:
+        with self._lock:
+            return self._conn.execute("DELETE FROM gallery_verdicts WHERE project=? AND slug=?", (project, slug)).rowcount
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

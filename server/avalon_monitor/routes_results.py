@@ -81,10 +81,11 @@ async def results_push(project: str, request: Request, host: HostRow = Depends(r
 
 @router.get("/projects")
 async def results_projects(ident: Identity = Depends(require_viewer)):
-    """Projects with results or image galleries (a gallery-only project has pushes 0)."""
+    """Projects with results or image galleries (a gallery-only project has pushes 0). Galleries are login-only: a
+    trusted-network viewer gets galleries 0 everywhere and no gallery-only projects."""
     from .routes_gallery import gallery_projects   # imports this module
     projects = await run_in_threadpool(db.results_projects)
-    galleries = await run_in_threadpool(gallery_projects)
+    galleries = await run_in_threadpool(gallery_projects) if ident.method == "access" else {}
     for p in projects:
         p["galleries"] = galleries.pop(p["project"], 0)
     projects += [{"project": k, "pushes": 0, "last_received": None, "last_commit": None, "galleries": n} for k, n in sorted(galleries.items())]

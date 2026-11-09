@@ -152,12 +152,37 @@ writes one index per set and pushes it with `python3 tools/gallery_push.py INDEX
 `agent.conf` like `avm` and uploads a zip to `POST /api/v1/projects/<project>/gallery`. The index:
 `{"project", "set", "kind": "synthetic|real", "image_root", "labels": [...], "items": [{"file",
 "width", "height", "text", "seed", "session", "tags": {flat scalars, e.g. "kept": true},
-"boxes": [{"label", "score", "bbox": [x, y, w, h]}]}]}`, bbox in pixels from the top-left, `file`
+"boxes": [{"id" (optional), "label", "score", "bbox": [x, y, w, h]}]}]}`, bbox in pixels from the top-left, `file`
 relative to `image_root` (which only the pusher reads; it is not sent). Re-pushing a set replaces it;
 an operator can delete one from the page. A set is capped at `AVM_GALLERY_MAX_BYTES` (default 300 MB,
 upload and unpacked) and 20,000 items, and the hub stores it under `<dir of AVM_DB_PATH>/galleries/`.
 A data-use host (`AVM_DATA_USE`) is refused with 403: a gallery is raw images. Everything pushed is
-visible to every dashboard viewer, so push only images anyone with dashboard access may see.
+visible to every dashboard viewer with an Access login, so push only images anyone who can sign in may see.
+
+Galleries are **login-only**: every gallery read (the set list, index, images, thumbnails and verdicts) needs the
+Cloudflare Access login (`require_login`). Trusted-network viewers (tailnet/LAN, no login) get 403 there, see
+`galleries: 0` and no gallery-only projects in `/api/v1/projects`, and do not receive gallery websocket events;
+their research page shows the Gallery section with a note to open the page through the public address instead.
+Pushing and the agent export use agent tokens and are unchanged.
+
+**Per-box review.** A box may carry an `"id"` (1-32 characters of `A-Z a-z 0-9 _ -`, unique within its item;
+Tinyseek uses a short hash of label + rounded bbox, so it is stable across re-exports). A box without an id simply
+can't be reviewed, and old indexes still push. In the grid and in the full-size view an operator **left-clicks
+inside a box to mark it good** and **right-clicks to mark it bad** (the browser menu is suppressed only over the
+image); the same click again clears it, the other one flips it. The smallest drawn box under the pointer is the one
+meant; clicks outside every box behave as before (a tile opens the full-size view). Good boxes are green with ✓, bad
+ones red with ✗, and reviewed boxes are always drawn whatever the score slider says. The set shows
+"reviewed N / M boxes (good g, bad b)" and a review filter (has unreviewed boxes / has bad boxes / fully reviewed).
+Viewers who can't change things see the verdicts but can't set them. The API:
+`GET /api/v1/projects/<p>/galleries/<slug>/verdicts` (signed-in viewers) and
+`PUT` on the same path with `{"file", "box_id", "verdict": "good" | "bad" | null}` (operators only, like deleting a
+set; `null` clears; 404 for a file or box id not in the current index, 422 for another verdict). For training
+pipelines, `GET /api/v1/agent/projects/<p>/galleries/<slug>/verdicts` takes an agent token and returns
+`{"project", "set", "slug", "exported_at", "verdicts": [{"file", "box_id", "verdict", "at", "by"}]}` (ISO times);
+`python3 tools/gallery_verdicts.py <project> <set-or-slug> [--out FILE] [--config PATH]` (stdlib, finds `agent.conf`
+like the pusher) writes that JSON to stdout or FILE. **Verdicts survive re-pushes**: they are keyed by
+(set, file, box id), and every reader only counts those whose box is in the current index; the others stay stored
+(and return if a later push brings the box back). Deleting the set deletes its verdicts.
 
 Claude sessions launched from the Agents tab are told (via system prompt) to wrap
 long-running work in `avm run`, so their training runs show up as tasks.
