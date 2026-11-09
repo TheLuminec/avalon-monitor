@@ -170,7 +170,9 @@ Tinyseek uses a short hash of label + rounded bbox, so it is stable across re-ex
 can't be reviewed, and old indexes still push. In the grid and in the full-size view an operator **left-clicks
 inside a box to mark it good** and **right-clicks to mark it bad** (the browser menu is suppressed only over the
 image); the same click again clears it, the other one flips it. The smallest drawn box under the pointer is the one
-meant; clicks outside every box behave as before (a tile opens the full-size view). Good boxes are green with ✓, bad
+meant; clicks outside every box behave as before (a tile opens the full-size view). A box whose area is covered by a
+smaller one has no clickable spot, so the full-size view's box list also has **✓ good / ✗ bad buttons on every row**
+(hovering a row highlights its box on the image). Good boxes are green with ✓, bad
 ones red with ✗, and reviewed boxes are always drawn whatever the score slider says. The set shows
 "reviewed N / M boxes (good g, bad b)" and a review filter (has unreviewed boxes / has bad boxes / fully reviewed).
 Viewers who can't change things see the verdicts but can't set them. The API:

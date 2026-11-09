@@ -1,7 +1,7 @@
 // Research results pages: renders the latest document a project pushed with `avm results push`
 // (schema "<name>-results/<n>") and per-metric history across pushes. Everything is rendered as
 // text/SVG from the pushed document only - nothing is ever fetched from the project itself.
-import { $, h, fmt, state, api, post, guard, on, navigate, toast, canChange, roTip } from "./core.js?v=1.16.0";
+import { $, h, fmt, state, api, post, guard, on, navigate, toast, canChange, roTip } from "./core.js?v=1.16.1";
 
 const NS = "http://www.w3.org/2000/svg";
 function s(tag, attrs = {}, ...kids) {
@@ -607,7 +607,8 @@ export function boxOverlay(item, thr, colorOf, big = false, vOf = noVerdict) {
     const [x, y, w, bh] = bb;
     const v = typeof b.id === "string" ? vOf(item.file, b.id) : null;
     const col = v === "good" ? "var(--c-green)" : v === "bad" ? "var(--c-red)" : colorOf(b.label);
-    g.append(s("rect", { x, y, width: Math.max(0, w), height: Math.max(0, bh), class: "gal-box" + (v ? " gal-" + v : ""), style: `--bc:${col}` }));
+    g.append(s("rect", { x, y, width: Math.max(0, w), height: Math.max(0, bh), class: "gal-box" + (v ? " gal-" + v : ""), style: `--bc:${col}`,
+      "data-bid": typeof b.id === "string" ? b.id : null }));   // lets the full-size view's box list highlight it
     const text = `${v ? VERDICT_MARK[v] + " " : ""}${b.label} ${fScore(b.score)}`;
     const ty = y > fs * 1.2 ? y - fs * 0.3 : y + fs;   // above the box, or inside it at the top edge
     const right = x + text.length * fs * 0.62 > W;      // would run off the right edge: end it at the box's right side
@@ -642,16 +643,34 @@ function galleryModal(ctx, list, start) {
         h("thead", {}, h("tr", {}, h("th", {}, "label"), h("th", { class: "r" }, "score"), h("th", {}, "bbox [x, y, w, h]"), h("th", {}, "review"))),
         h("tbody", {}, boxes.map((b) => {
           const v = typeof b.id === "string" ? ctx.vOf(it.file, b.id) : null;
-          return h("tr", { class: (num(b.score) != null && b.score >= thr) || v ? "" : "below" },
+          const id = typeof b.id === "string" ? b.id : null;
+          return h("tr", { class: (num(b.score) != null && b.score >= thr) || v ? "" : "below",
+            onmouseenter: id ? () => highlight(id, true) : null, onmouseleave: id ? () => highlight(id, false) : null },
             h("td", {}, h("i", { class: "lg-sw", style: `background:${ctx.colorOf(b.label)}` }), " ", b.label),
             h("td", { class: "r num" }, fScore(b.score)),
             h("td", { class: "num" }, Array.isArray(b.bbox) ? b.bbox.map((x) => (num(x) == null ? "?" : +x.toFixed(1))).join(", ") : "—"),
-            h("td", { class: v ? "gal-v-" + v : "muted", title: typeof b.id === "string" ? `box id ${b.id}` : "no id: can't be reviewed" },
-              v ? `${VERDICT_MARK[v]} ${v}` : typeof b.id === "string" ? "—" : "n/a"));
+            reviewCell(it, b, v));
         })))
         : h("div", { class: "muted" }, "no boxes"),
-      r.n ? h("div", { class: "muted gal-hint" }, canChange() ? "Click inside a box: good · right-click: bad · the same click again clears it."
+      r.n ? h("div", { class: "muted gal-hint" }, canChange()
+        ? "Click inside a box: good · right-click: bad · the same click again clears it. Boxes hidden under others: use the ✓ / ✗ buttons in this list."
         : "Sign in to review boxes.") : null);
+  }
+  // The review cell of one box row. Operators get ✓ good / ✗ bad buttons, so every box can be reviewed, including one
+  // whose area is covered by a smaller box (the image click picks the smallest box under the pointer). Hovering the row
+  // highlights its box on the image.
+  function reviewCell(it, b, v) {
+    const id = typeof b.id === "string" ? b.id : null;
+    if (!id) return h("td", { class: "muted", title: "no id: can't be reviewed" }, "n/a");
+    if (!canChange()) return h("td", { class: v ? "gal-v-" + v : "muted", title: `box id ${id}` }, v ? `${VERDICT_MARK[v]} ${v}` : "—");
+    const btn = (which, label) => h("button", {
+      class: "btn small gal-vbtn gal-vbtn-" + which + (v === which ? " active" : ""), "aria-pressed": v === which ? "true" : "false",
+      title: v === which ? `marked ${which}: click to clear` : `mark this box ${which}`,
+      onclick: (e) => { e.stopPropagation(); ctx.setVerdict(it, id, nextVerdict(v, which)); } }, label);
+    return h("td", { class: "gal-vcell", title: `box id ${id}` }, btn("good", `${VERDICT_MARK.good} good`), " ", btn("bad", `${VERDICT_MARK.bad} bad`));
+  }
+  function highlight(id, on) {   // the box list's row hover: outline that box on the image (if it is drawn)
+    for (const el of fig?.querySelectorAll(".gal-ovl .gal-box") || []) el.classList.toggle("gal-hl", on && el.getAttribute("data-bid") === id);
   }
   function draw() {
     const it = list[i];
@@ -710,7 +729,7 @@ function gallerySection(project, sets) {
     if (!colors.has(lab)) colors.set(lab, `var(${SERIES[colors.size % SERIES.length]})`);
     return colors.get(lab);
   };
-  const ctx = { project, slug: () => f.slug, thr: () => f.thr, colorOf, vOf, review, listeners: new Set() };
+  const ctx = { project, slug: () => f.slug, thr: () => f.thr, colorOf, vOf, review, setVerdict, listeners: new Set() };
 
   const opt = (v, label, sel = false) => h("option", { value: v, selected: sel ? "" : null }, label);
   const setSel = h("select", { title: "Image set" });

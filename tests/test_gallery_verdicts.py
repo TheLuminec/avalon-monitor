@@ -338,3 +338,22 @@ console.log(JSON.stringify({ out, empty: txt(galleryNote("p", [])), some: galler
     out = json.loads(r.stdout)
     assert "need a login" in out["out"] and "monitor.example.test" in out["out"]
     assert "No image sets pushed yet" in out["empty"] and out["some"] is None
+
+
+def test_ui_box_list_review_buttons():
+    """Gallery verdicts (static, source-text; owner report 11-09): a box covered by a smaller one had no clickable
+    spot, because an image click picks the smallest box under the pointer. The full-size view's box list now gives
+    operators per-row ✓ good / ✗ bad buttons that set that box's verdict by id (toggling via nextVerdict, through the
+    same optimistic setVerdict), read-only viewers still see plain text, and hovering a row highlights its box via
+    data-bid on the overlay rect."""
+    src = (STATIC / "research.js").read_text()
+    assert "function reviewCell(it, b, v)" in src and "reviewCell(it, b, v)" in src
+    assert "ctx.setVerdict(it, id, nextVerdict(v, which))" in src
+    assert "review, setVerdict, listeners: new Set()" in src           # the modal reaches the same PUT/rollback path
+    cell = src[src.index("function reviewCell(it, b, v)"):src.index("function highlight(id, on)")]
+    assert cell.index("if (!canChange())") < cell.index('h("button"')      # read-only viewers get no buttons
+    assert '"data-bid": typeof b.id === "string" ? b.id : null' in src
+    assert 'el.classList.toggle("gal-hl", on && el.getAttribute("data-bid") === id)' in src
+    assert "onmouseenter: id ? () => highlight(id, true) : null" in src
+    css = (STATIC / "app.css").read_text()
+    assert "svg .gal-box.gal-hl" in css and ".gal-vbtn-good.active" in css and ".gal-vbtn-bad.active" in css

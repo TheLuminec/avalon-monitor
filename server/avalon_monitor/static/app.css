@@ -539,6 +539,13 @@ svg .gal-box.gal-good, svg .gal-box.gal-bad { stroke-width: 3.5; }
 svg .gal-box.gal-bad { stroke-dasharray: 6 3; }
 .gal-v-good { color: color-mix(in srgb, var(--c-green), white var(--gal-lift)); font-weight: 600; }
 .gal-v-bad { color: color-mix(in srgb, var(--c-red), white var(--gal-lift)); font-weight: 600; }
+/* full-size view's box list: per-row review buttons (reach boxes covered by smaller ones) and the hover highlight */
+svg .gal-box.gal-hl { stroke-width: 5; fill: color-mix(in srgb, var(--bc) 22%, transparent); }
+.gal-vcell { white-space: nowrap; }
+.gal-vbtn { padding: 1px 7px; }
+.gal-vbtn-good.active { background: color-mix(in srgb, var(--c-green) 28%, transparent); border-color: var(--c-green); font-weight: 600; }
+.gal-vbtn-bad.active { background: color-mix(in srgb, var(--c-red) 28%, transparent); border-color: var(--c-red); font-weight: 600; }
+.gal-boxes tr:hover td { background: color-mix(in srgb, var(--ink) 6%, transparent); }
 .gal-review { margin-top: -6px; }
 .gal-hint { margin-top: 8px; }
 .gal-tile, .gal-full { -webkit-touch-callout: none; }
