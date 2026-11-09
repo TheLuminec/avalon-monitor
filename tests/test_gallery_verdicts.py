@@ -17,6 +17,13 @@ from avalon_monitor import core
 from conftest import WRITE
 from test_gallery import ROOT, STATIC, item, make_zip, needs_node, proj, push
 
+
+def _core_query():
+    """The ?v= query research.js imports core.js with, so node loads the same module instance (as test_ui does)."""
+    import re
+    m = re.search(r'from "\./core\.js(\?[^"]*)?"', (STATIC / "research.js").read_text())
+    return (m.group(1) or "") if m else ""
+
 SLUG = "synthetic__cup__a"
 
 
@@ -325,7 +332,7 @@ state.config = { public_url: "https://monitor.example.test", user: { method: "tr
 const out = txt(galleryNote("p", []));
 state.config.user.method = "access";
 console.log(JSON.stringify({ out, empty: txt(galleryNote("p", [])), some: galleryNote("p", [{slug: "s"}]) }));
-""" % (json.dumps((STATIC / "research.js").as_uri()), json.dumps((STATIC / "core.js").as_uri() + "?v=1.15.0"))
+""" % (json.dumps((STATIC / "research.js").as_uri()), json.dumps((STATIC / "core.js").as_uri() + _core_query()))
     r = subprocess.run(["node", "--input-type=module", "-e", js], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
