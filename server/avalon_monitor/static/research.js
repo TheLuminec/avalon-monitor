@@ -1,7 +1,7 @@
 // Research results pages: renders the latest document a project pushed with `avm results push`
 // (schema "<name>-results/<n>") and per-metric history across pushes. Everything is rendered as
 // text/SVG from the pushed document only - nothing is ever fetched from the project itself.
-import { $, h, fmt, state, api, on, navigate, toast } from "./core.js?v=1.14.3";
+import { $, h, fmt, state, api, post, guard, on, navigate, toast } from "./core.js?v=1.14.3";
 
 const NS = "http://www.w3.org/2000/svg";
 function s(tag, attrs = {}, ...kids) {
@@ -500,6 +500,230 @@ function dotbarFigure(fig, colors) {
     notes.length ? h("ul", { class: "fig-notes" }, notes.map((n) => h("li", {}, n))) : null);
 }
 
+// ------------------------------------------------------------- gallery
+// Image sets a project pushed with tools/gallery_push.py (routes_gallery.py): a grid of thumbnails with the
+// boxes drawn over each, filters, a score threshold, and a full-size view with every detail. Images come only
+// from the hub's copy of what was pushed. 2,000+ items stay smooth: tiles are built CHUNK at a time as the
+// grid scrolls (IntersectionObserver on a sentinel, plus a "show more" button), and a tile is built once and
+// kept; a threshold change only redraws the overlays of the tiles shown.
+const CHUNK = 120;
+const encPath = (f) => String(f).split("/").map(encodeURIComponent).join("/");
+export const galleryUrl = (project, slug, kind, file) => `/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(slug)}/${kind}/${encPath(file)}`;
+export const boxesAbove = (item, thr) => (Array.isArray(item?.boxes) ? item.boxes : []).filter((b) => num(b?.score) != null && b.score >= thr);
+const keptOf = (item) => (item?.tags && typeof item.tags.kept === "boolean" ? item.tags.kept : null);
+const fScore = (v) => (num(v) == null ? "—" : v.toFixed(2));
+export const NO_BOX = Symbol("no box");   // never a label (a label can be any string)
+
+/** Items passing the filters: label ("" any, NO_BOX = no box at/above the threshold, else a box with that label
+ *  at/above it), session ("" any), kept ("" any, "kept", "dropped"; from tags.kept). */
+export function filterItems(items, f) {
+  return items.filter((it) => {
+    if (f.session !== "" && String(it.session ?? "") !== f.session) return false;
+    if (f.kept === "kept" && keptOf(it) !== true) return false;
+    if (f.kept === "dropped" && keptOf(it) !== false) return false;
+    if (f.label === "") return true;
+    const above = boxesAbove(it, f.thr);
+    return f.label === NO_BOX ? above.length === 0 : above.some((b) => b.label === f.label);
+  });
+}
+
+/** One item's boxes as an SVG in the image's own pixel space (viewBox = width x height, top-left origin), laid over
+ *  the image and scaled with it; boxes scoring below `thr` are left out. `big` = the full-size view (smaller labels). */
+export function boxOverlay(item, thr, colorOf, big = false) {
+  const W = item.width, H = item.height;
+  const g = s("svg", { class: "gal-ovl", viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "xMidYMid meet", "aria-hidden": "true" });
+  const fs = Math.max(W, H) / (big ? 40 : 16);
+  for (const b of boxesAbove(item, thr)) {
+    const bb = Array.isArray(b.bbox) && b.bbox.length === 4 && b.bbox.every((v) => num(v) != null) ? b.bbox : null;
+    if (!bb) continue;
+    const [x, y, w, bh] = bb;
+    const col = colorOf(b.label);
+    g.append(s("rect", { x, y, width: Math.max(0, w), height: Math.max(0, bh), class: "gal-box", style: `--bc:${col}` }));
+    const text = `${b.label} ${fScore(b.score)}`;
+    const ty = y > fs * 1.2 ? y - fs * 0.3 : y + fs;   // above the box, or inside it at the top edge
+    const right = x + text.length * fs * 0.62 > W;      // would run off the right edge: end it at the box's right side
+    g.append(s("text", { x: right ? Math.min(W, x + w) - fs * 0.15 : x + fs * 0.15, y: ty, "text-anchor": right ? "end" : null,
+      class: "gal-lab", style: `--bc:${col};font-size:${fs}px` }, text));
+  }
+  return g;
+}
+
+// Full-size view of list[start]: the image with its boxes and every detail. Esc closes, arrow keys step.
+function galleryModal(ctx, list, start) {
+  let i = start;
+  const body = h("div", { class: "gal-modal-body" });
+  const close = () => { document.removeEventListener("keydown", onKey); wrap.remove(); };
+  const go = (d) => { if (list.length) { i = (i + d + list.length) % list.length; draw(); } };
+  const onKey = (e) => {
+    if (e.key === "Escape") { e.preventDefault(); close(); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); go(-1); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); go(1); }
+  };
+  const row = (k, v) => h("tr", {}, h("th", {}, k), h("td", {}, v == null || v === "" ? "—" : String(v)));
+  const KNOWN = ["file", "width", "height", "text", "seed", "session", "tags", "boxes", "_i"];
+  function draw() {
+    const it = list[i], thr = ctx.thr();
+    const fig = h("div", { class: "gal-full", style: `aspect-ratio:${it.width} / ${it.height}` },
+      h("img", { src: galleryUrl(ctx.project, ctx.slug(), "image", it.file), alt: it.file, decoding: "async" }),
+      boxOverlay(it, thr, ctx.colorOf, true));
+    const boxes = (it.boxes || []).slice().sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    body.replaceChildren(
+      h("div", { class: "gal-full-wrap" }, fig),
+      h("div", { class: "gal-detail" },
+        h("div", { class: "gal-nav" },
+          h("button", { class: "btn small", onclick: () => go(-1), title: "previous (←)" }, "←"),
+          h("span", { class: "muted num" }, `${i + 1} / ${list.length}`),
+          h("button", { class: "btn small", onclick: () => go(1), title: "next (→)" }, "→"),
+          h("button", { class: "btn small gal-close", onclick: close, title: "close (Esc)" }, "Close")),
+        h("table", { class: "gal-kv" }, h("tbody", {},
+          row("file", it.file), row("size", `${it.width} × ${it.height}`), row("text", it.text), row("seed", it.seed), row("session", it.session),
+          ...Object.entries(it.tags || {}).map(([k, v]) => row(`tags.${k}`, v)),
+          ...Object.entries(it).filter(([k]) => !KNOWN.includes(k)).map(([k, v]) => row(k, v)))),
+        h("h4", {}, `Boxes (${boxes.length}; dimmed = below ${thr.toFixed(2)})`),
+        boxes.length ? h("table", { class: "gal-kv gal-boxes" },
+          h("thead", {}, h("tr", {}, h("th", {}, "label"), h("th", { class: "r" }, "score"), h("th", {}, "bbox [x, y, w, h]"))),
+          h("tbody", {}, boxes.map((b) => h("tr", { class: num(b.score) != null && b.score >= thr ? "" : "below" },
+            h("td", {}, h("i", { class: "lg-sw", style: `background:${ctx.colorOf(b.label)}` }), " ", b.label),
+            h("td", { class: "r num" }, fScore(b.score)),
+            h("td", { class: "num" }, Array.isArray(b.bbox) ? b.bbox.map((v) => (num(v) == null ? "?" : +v.toFixed(1))).join(", ") : "—")))))
+          : h("div", { class: "muted" }, "no boxes")));
+  }
+  const wrap = h("div", { class: "gal-modal", role: "dialog", "aria-modal": "true", onclick: (e) => { if (e.target === wrap) close(); } }, body);
+  document.addEventListener("keydown", onKey);
+  document.body.append(wrap);
+  draw();
+}
+
+function gallerySection(project, sets) {
+  const root = h("div", { class: "card table-card gallery" });
+  const kinds = [...new Set(sets.map((x) => x.kind).filter(Boolean))];
+  const f = { kind: "", slug: sets[0].slug, label: "", session: "", kept: "", thr: 0 };
+  let index = null, colors = new Map(), shown = [], tiles = new Map(), upto = 0, raf = 0, loadSeq = 0, labelOpts = [""];
+  const colorOf = (lab) => {
+    if (!colors.has(lab)) colors.set(lab, `var(${SERIES[colors.size % SERIES.length]})`);
+    return colors.get(lab);
+  };
+  const ctx = { project, slug: () => f.slug, thr: () => f.thr, colorOf };
+
+  const opt = (v, label, sel = false) => h("option", { value: v, selected: sel ? "" : null }, label);
+  const setSel = h("select", { title: "Image set" });
+  const kindSel = h("select", { title: "Kind" }, opt("", "all kinds", true), kinds.map((k) => opt(k, k)));
+  const labelSel = h("select", { title: "Label: items with a box of it at or above the threshold" });
+  const sessSel = h("select", { title: "Session" });
+  const keptSel = h("select", { title: "Kept / dropped (tags.kept)" }, opt("", "kept + dropped", true), opt("kept", "kept"), opt("dropped", "dropped"));
+  const thrVal = h("span", { class: "num gal-thr-val" }, "0.00");
+  const slider = h("input", { type: "range", min: "0", max: "1", step: "0.01", value: "0", class: "gal-thr", "aria-label": "score threshold" });
+  const counts = h("div", { class: "gal-counts muted" });
+  const meta = h("div", { class: "research-meta gal-meta" });
+  const grid = h("div", { class: "gal-grid" });
+  const more = h("button", { class: "btn small gal-more", hidden: "" }, "show more");
+  const sentinel = h("div", { class: "gal-sentinel" });
+  const delBtn = guard(h("button", { class: "btn small danger", title: "Delete this set from the hub" }, "Delete set"));
+  kindSel.hidden = kinds.length < 2;
+
+  function fillSets() {
+    const avail = sets.filter((x) => f.kind === "" || x.kind === f.kind);
+    if (!avail.some((x) => x.slug === f.slug) && avail.length) f.slug = avail[0].slug;
+    setSel.replaceChildren(...avail.map((x) => opt(x.slug, `${x.set} (${x.items})`, x.slug === f.slug)));
+  }
+  function tileFor(j) {
+    let t = tiles.get(j);
+    if (!t) {
+      const it = index.items[j];
+      t = h("button", { class: "gal-tile", title: it.file, onclick: () => galleryModal(ctx, shown.map((k) => index.items[k]), shown.indexOf(j)) },
+        h("img", { src: galleryUrl(project, f.slug, "thumb", it.file), alt: it.file, loading: "lazy", decoding: "async" }));
+      tiles.set(j, t);
+    }
+    if (t._thr !== f.thr) {   // (re)draw the overlay for the current threshold
+      t.querySelector(".gal-ovl")?.remove();
+      t.append(boxOverlay(index.items[j], f.thr, colorOf));
+      t._thr = f.thr;
+    }
+    return t;
+  }
+  function renderMore() {
+    const next = Math.min(shown.length, upto + CHUNK);
+    grid.append(...shown.slice(upto, next).map(tileFor));
+    upto = next;
+    more.hidden = upto >= shown.length;
+  }
+  function refresh(keep = false) {   // keep: as many tiles as were already shown (a threshold move keeps the scroll)
+    const want = keep ? Math.max(upto, CHUNK) : CHUNK;
+    shown = filterItems(index.items, f).map((it) => it._i);
+    let nBoxes = 0;
+    for (const j of shown) nBoxes += boxesAbove(index.items[j], f.thr).length;
+    counts.textContent = `showing ${shown.length} of ${index.items.length}, ${nBoxes} box${nBoxes === 1 ? "" : "es"} ≥ ${f.thr.toFixed(2)}`;
+    grid.replaceChildren();
+    upto = 0;
+    while (upto < Math.min(want, shown.length)) renderMore();
+    more.hidden = upto >= shown.length;
+    if (!shown.length) grid.append(h("div", { class: "muted gal-none" }, "No items match these filters."));
+  }
+  async function loadSet() {
+    const seq = ++loadSeq;
+    index = null;
+    grid.replaceChildren(h("div", { class: "muted gal-none" }, "Loading…"));
+    let doc;
+    try { doc = await api(`/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(f.slug)}`); }
+    catch (e) { if (seq === loadSeq) grid.replaceChildren(h("div", { class: "muted gal-none" }, `Cannot load this set: ${e.message}`)); return; }
+    if (seq !== loadSeq) return;   // another set was picked meanwhile
+    doc.items = (Array.isArray(doc.items) ? doc.items : []).filter((it) => it && num(it.width) > 0 && num(it.height) > 0);
+    doc.items.forEach((it, j) => { it._i = j; });
+    index = doc; tiles = new Map(); colors = new Map();
+    for (const l of [...(doc.labels || []), ...doc.items.flatMap((it) => (it.boxes || []).map((b) => b.label))]) colorOf(l);
+    const sessions = [...new Set(doc.items.map((it) => it.session).filter((v) => v != null).map(String))].sort();
+    f.label = ""; f.session = "";
+    // option values index labelOpts (labels are arbitrary strings; NO_BOX is not a string at all)
+    labelOpts = ["", ...colors.keys(), NO_BOX];
+    labelSel.replaceChildren(...labelOpts.map((l, k) => opt(String(k), l === "" ? "any label" : l === NO_BOX ? "no box ≥ threshold" : l, k === 0)));
+    sessSel.replaceChildren(opt("", "all sessions", true), ...sessions.map((x) => opt(x, x)));
+    sessSel.hidden = !sessions.length;
+    keptSel.hidden = !doc.items.some((it) => keptOf(it) != null);
+    const m = sets.find((x) => x.slug === f.slug) || {};
+    meta.replaceChildren(...[
+      m.kind ? h("span", { class: "chip" }, m.kind) : null,
+      h("span", {}, `${doc.items.length} items · ${fmt.bytes(m.bytes)}`),
+      h("span", {}, `pushed ${m.pushed_at ? fmt.ago(Date.now() / 1000 - m.pushed_at) : "?"}${m.host ? " from " + m.host : ""}`),
+      m.thumbs === false ? h("span", {}, "no thumbnails: tiles load full images") : null,
+      h("span", { class: "viz-legend" }, [...colors.keys()].map((l) => h("span", {}, h("i", { class: "lg-sw", style: `background:${colorOf(l)}` }), l))),
+    ].filter(Boolean));
+    refresh();
+  }
+
+  setSel.addEventListener("change", () => { f.slug = setSel.value; loadSet(); });
+  kindSel.addEventListener("change", () => { f.kind = kindSel.value; const before = f.slug; fillSets(); if (f.slug !== before) loadSet(); });
+  labelSel.addEventListener("change", () => { f.label = labelOpts[Number(labelSel.value)] ?? ""; if (index) refresh(); });
+  sessSel.addEventListener("change", () => { f.session = sessSel.value; if (index) refresh(); });
+  keptSel.addEventListener("change", () => { f.kept = keptSel.value; if (index) refresh(); });
+  slider.addEventListener("input", () => {
+    f.thr = Number(slider.value) || 0; thrVal.textContent = f.thr.toFixed(2);
+    cancelAnimationFrame(raf); raf = requestAnimationFrame(() => { if (index) refresh(true); });
+  });
+  more.addEventListener("click", renderMore);
+  delBtn.addEventListener("click", async () => {
+    const m = sets.find((x) => x.slug === f.slug);
+    if (!m || !confirm(`Delete the image set "${m.set}" (${m.items} items) from the hub?`)) return;
+    try { await post(`/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(m.slug)}`, undefined, "DELETE"); toast(`Deleted ${m.set}`); renderResearch({ project }); }
+    catch (e) { toast(e.message, true); }
+  });
+  if ("IntersectionObserver" in window) {
+    const io = new IntersectionObserver((es) => {
+      if (!sentinel.isConnected) { io.disconnect(); return; }   // the page was left
+      if (es.some((e) => e.isIntersecting) && index && upto < shown.length) renderMore();
+    }, { rootMargin: "600px" });
+    io.observe(sentinel);
+  }
+
+  fillSets();
+  root.append(
+    h("div", { class: "fig-head" }, h("h3", {}, "Gallery"), h("span", { class: "muted fig-cap" }, `${sets.length} image set${sets.length === 1 ? "" : "s"} · visible to every dashboard viewer`)),
+    h("div", { class: "gal-controls" }, setSel, kindSel, labelSel, sessSel, keptSel,
+      h("label", { class: "gal-thr-wrap", title: "Hide boxes scoring below this" }, "score ≥", slider, thrVal), delBtn),
+    meta, counts, grid, more, sentinel);
+  loadSet();
+  return root;
+}
+
 // ---------------------------------------------------------------- page
 const view = { project: null, push: null };
 
@@ -515,17 +739,26 @@ export async function renderResearch(params = {}) {
   }
   const project = params.project && projects.some((p) => p.project === params.project) ? params.project : projects[0].project;
   view.project = project; view.push = params.push ? Number(params.push) : null;
-  let cur, hist;
+  const pinfo = projects.find((p) => p.project === project) || {};
+  const projSel = projects.length > 1 ? h("select", { onchange: (e) => navigate(`#/research/${e.target.value}`) },
+    projects.map((p) => h("option", { value: p.project, selected: p.project === project ? "" : null }, p.project))) : null;
+  const galleries = pinfo.galleries ? api(`/api/v1/projects/${project}/galleries`).then((r) => r.galleries || []).catch(() => []) : Promise.resolve([]);
+  if (!pinfo.pushes) {   // a project with image galleries only
+    const sets = await galleries;
+    if (state.view !== "research" || view.project !== project) return;
+    app.append(h("div", { class: "page-head" }, h("h2", {}, "Research"), h("span", { class: "muted" }, project), h("div", { class: "filters" }, projSel)),
+      sets.length ? gallerySection(project, sets) : h("div", { class: "empty" }, "Nothing pushed for this project."));
+    return;
+  }
+  let cur, hist, sets;
   try {
-    [cur, hist] = await Promise.all([api(`/api/v1/projects/${project}/results${view.push ? "?push=" + view.push : ""}`), api(`/api/v1/projects/${project}/results/history`)]);
+    [cur, hist, sets] = await Promise.all([api(`/api/v1/projects/${project}/results${view.push ? "?push=" + view.push : ""}`), api(`/api/v1/projects/${project}/results/history`), galleries]);
   } catch (e) { app.append(h("div", { class: "empty" }, `Cannot load results: ${e.message}`)); return; }
   if (state.view !== "research" || view.project !== project) return;  // navigated away meanwhile
   const pushes = hist.pushes;
   const latestId = pushes.length ? pushes[pushes.length - 1].id : cur.id;
   const doc = cur.doc || {};
 
-  const projSel = projects.length > 1 ? h("select", { onchange: (e) => navigate(`#/research/${e.target.value}`) },
-    projects.map((p) => h("option", { value: p.project, selected: p.project === project ? "" : null }, p.project))) : null;
   const pushSel = h("select", { title: "View an earlier push", onchange: (e) => navigate(`#/research/${project}${Number(e.target.value) === latestId ? "" : "?push=" + e.target.value}`) },
     [...pushes].reverse().map((p) => h("option", { value: p.id, selected: p.id === cur.id ? "" : null },
       `#${p.id} · ${fmt.when(p.received)}${p.commit ? " · " + p.commit : ""}${p.id === latestId ? " (latest)" : ""}`)));
@@ -553,6 +786,7 @@ export async function renderResearch(params = {}) {
     notesEl,
     programmes(doc),
     figs.length ? h("div", { class: "research-figs" }, figs) : null,
+    sets.length ? gallerySection(project, sets) : null,
   ].filter(Boolean));
 }
 
@@ -560,4 +794,9 @@ on("results", (m) => {
   if (state.view !== "research") return;
   if (m.project === view.project && !view.push) { toast(`New ${m.project} results (#${m.id})`); renderResearch({ project: view.project }); }
   else if (!view.project) renderResearch({});
+});
+// a gallery push or delete: say so, without reloading the page under someone browsing it
+on("gallery", (m) => {
+  if (state.view === "research" && m.project === view.project && !document.querySelector(".gal-modal"))
+    toast(`${m.project} gallery ${m.deleted ? "set deleted" : "updated"}: ${m.slug} (reopen the page to see it)`);
 });

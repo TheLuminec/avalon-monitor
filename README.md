@@ -144,6 +144,21 @@ history is keyed on them. There's no dry run and a push can't be deleted, so che
 throwaway hub before pushing it. The hub renders only what is pushed and never reads the project
 itself, so a feed must carry aggregates only.
 
+**Image galleries** let you browse a project's image sets on its research page: a grid
+with the bounding boxes drawn over each image, filters (label, session, kept/dropped, kind), a score
+threshold slider, and a full-size view with every detail (Esc closes, arrow keys step). The project
+writes one index per set and pushes it with `python3 tools/gallery_push.py INDEX.json [--dry-run]`
+(stdlib; Pillow, when installed, adds ~320 px thumbnails), which reads the hub URL and token from
+`agent.conf` like `avm` and uploads a zip to `POST /api/v1/projects/<project>/gallery`. The index:
+`{"project", "set", "kind": "synthetic|real", "image_root", "labels": [...], "items": [{"file",
+"width", "height", "text", "seed", "session", "tags": {flat scalars, e.g. "kept": true},
+"boxes": [{"label", "score", "bbox": [x, y, w, h]}]}]}`, bbox in pixels from the top-left, `file`
+relative to `image_root` (which only the pusher reads; it is not sent). Re-pushing a set replaces it;
+an operator can delete one from the page. A set is capped at `AVM_GALLERY_MAX_BYTES` (default 300 MB,
+upload and unpacked) and 20,000 items, and the hub stores it under `<dir of AVM_DB_PATH>/galleries/`.
+A data-use host (`AVM_DATA_USE`) is refused with 403: a gallery is raw images. Everything pushed is
+visible to every dashboard viewer, so push only images anyone with dashboard access may see.
+
 Claude sessions launched from the Agents tab are told (via system prompt) to wrap
 long-running work in `avm run`, so their training runs show up as tasks.
 

@@ -94,6 +94,9 @@ class Settings:
     # acknowledged on the dashboard or until this many hours after they last changed. 0 = never expire.
     task_alert_hours: float = 24
     max_payload_bytes: int = 512 * 1024
+    # Image galleries (routes_gallery.py): the cap on one pushed set, applied to the upload (compressed) and to its
+    # unpacked total alike. Its own cap: max_payload_bytes does not apply to gallery pushes.
+    gallery_max_bytes: int = 300 * 1024 * 1024
 
     # Derived-alert rules (hub-side). GPU stall: a host reports an active job
     # (a "job" check with value > 0) for at least `gpu_stall_minutes` while its
@@ -141,6 +144,7 @@ def load_settings() -> Settings:
     s.retention_tasks_days = int(env.get("AVM_RETENTION_TASKS_DAYS", s.retention_tasks_days))
     s.task_alert_hours = float(env.get("AVM_TASK_ALERT_HOURS", s.task_alert_hours))
     s.max_payload_bytes = int(env.get("AVM_MAX_PAYLOAD_BYTES", s.max_payload_bytes))
+    s.gallery_max_bytes = int(env.get("AVM_GALLERY_MAX_BYTES", s.gallery_max_bytes))
     s.gpu_stall_minutes = int(env.get("AVM_RULE_GPU_STALL_MINUTES", s.gpu_stall_minutes))
     s.gpu_stall_percent = float(env.get("AVM_RULE_GPU_STALL_PERCENT", s.gpu_stall_percent))
     s.agent_script = env.get("AVM_AGENT_SCRIPT", "")

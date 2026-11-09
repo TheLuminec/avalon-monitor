@@ -514,4 +514,43 @@ svg text.db-sub { fill: var(--ink-2); font-size: 11px; }
 svg text.db-grp { fill: var(--scl); font-size: 12px; font-weight: 700; }
 svg text.db-val { font-size: 11.5px; font-weight: 600; }
 .lg-db { display: inline-block; flex: none; }
+/* gallery: tiles are square; the image and its box overlay are both centred and "contain"-scaled, so they line up.
+   --bc is a label's series colour, lifted toward white in the dark theme like the dot-bars. */
+.gallery { margin-top: 14px; --gal-lift: 25%; }
+:root[data-theme="light"] .gallery, :root[data-theme="light"] .gal-modal { --gal-lift: 0%; }
+.gal-modal { --gal-lift: 25%; }
+.gal-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+.gal-controls select { max-width: 100%; }
+.gal-controls .danger { margin-left: auto; }
+.gal-thr-wrap { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--ink-2); }
+.gal-thr { width: 140px; accent-color: var(--accent); }
+.gal-thr-val { min-width: 2.6em; color: var(--ink); }
+.gal-meta { margin: 0 0 6px; }
+.gal-counts { font-size: 12.5px; margin-bottom: 10px; font-variant-numeric: tabular-nums; }
+.gal-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.gal-tile { position: relative; aspect-ratio: 1; padding: 0; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); overflow: hidden; cursor: zoom-in; }
+.gal-tile:hover, .gal-tile:focus-visible { border-color: var(--accent); outline: none; }
+.gal-tile img, .gal-full img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
+svg.gal-ovl { position: absolute; inset: 0; width: 100%; height: 100%; overflow: hidden; pointer-events: none; }
+svg .gal-box { fill: none; stroke: color-mix(in srgb, var(--bc), white var(--gal-lift)); stroke-width: 2; vector-effect: non-scaling-stroke; }
+svg text.gal-lab { fill: color-mix(in srgb, var(--bc), white var(--gal-lift)); font-weight: 650; paint-order: stroke; stroke: rgba(0,0,0,0.75); stroke-width: 3px; stroke-linejoin: round; vector-effect: non-scaling-stroke; font-variant-numeric: tabular-nums; }
+.gal-none { grid-column: 1 / -1; padding: 30px 0; text-align: center; }
+.gal-more { display: block; margin: 12px auto 0; }
+.gal-more[hidden] { display: none; }
+.gal-sentinel { height: 1px; }
+.gal-modal { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,0.72); display: flex; align-items: center; justify-content: center; padding: 16px; }
+.gal-modal-body { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius); box-shadow: var(--shadow); display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 14px; padding: 14px; width: min(1200px, 100%); max-height: calc(100vh - 32px); overflow: auto; }
+.gal-full-wrap { display: flex; align-items: center; justify-content: center; min-width: 0; }
+.gal-full { position: relative; width: 100%; max-height: calc(100vh - 64px); max-width: 100%; background: var(--surface-2); border-radius: var(--radius-sm); overflow: hidden; }
+.gal-detail { min-width: 0; font-size: 12.5px; }
+.gal-detail h4 { margin: 12px 0 6px; font-size: 12.5px; font-weight: 600; color: var(--ink-2); }
+.gal-nav { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.gal-nav .gal-close { margin-left: auto; }
+.gal-kv { width: 100%; border-collapse: collapse; }
+.gal-kv th, .gal-kv td { text-align: left; padding: 3px 6px 3px 0; vertical-align: top; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.gal-kv th { color: var(--ink-3); font-weight: 500; white-space: nowrap; }
+.gal-kv .r { text-align: right; }
+.gal-boxes tr.below td { opacity: 0.45; }
+.gal-kv .lg-sw, .gal-meta .lg-sw { display: inline-block; vertical-align: -1px; }
+@media (max-width: 800px) { .gal-modal-body { grid-template-columns: 1fr; } .gal-grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); } }
 @media (max-width: 600px) { .prog-row { grid-template-columns: 1fr; gap: 4px; } }

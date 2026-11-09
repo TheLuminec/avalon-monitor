@@ -636,6 +636,7 @@ function connectWs() {
     else if (msg.type === "check_deleted") emit("check_deleted", msg);
     else if (msg.type === "claude_untracked") emit("claude_untracked", msg);
     else if (msg.type === "results") emit("results", msg);
+    else if (msg.type === "gallery") emit("gallery", msg);
   };
   ws.onclose = (ev) => {
     state.live = false; $("#conn").className = "conn"; clearInterval(ping);

@@ -81,7 +81,14 @@ async def results_push(project: str, request: Request, host: HostRow = Depends(r
 
 @router.get("/projects")
 async def results_projects(ident: Identity = Depends(require_viewer)):
-    return {"projects": await run_in_threadpool(db.results_projects)}
+    """Projects with results or image galleries (a gallery-only project has pushes 0)."""
+    from .routes_gallery import gallery_projects   # imports this module
+    projects = await run_in_threadpool(db.results_projects)
+    galleries = await run_in_threadpool(gallery_projects)
+    for p in projects:
+        p["galleries"] = galleries.pop(p["project"], 0)
+    projects += [{"project": k, "pushes": 0, "last_received": None, "last_commit": None, "galleries": n} for k, n in sorted(galleries.items())]
+    return {"projects": projects}
 
 
 @router.get("/projects/{project}/results")

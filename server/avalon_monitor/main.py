@@ -48,6 +48,7 @@ from . import datause
 from .routes_checks import router as checks_router
 from .routes_ops import job_public, router as ops_router, task_public, tracked_public
 from .routes_results import router as results_router
+from .routes_gallery import router as gallery_router
 
 
 # --------------------------------------------------------------- serializers
@@ -597,6 +598,7 @@ async def index(request: Request):
 app.include_router(ops_router)
 app.include_router(checks_router)
 app.include_router(results_router)
+app.include_router(gallery_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 

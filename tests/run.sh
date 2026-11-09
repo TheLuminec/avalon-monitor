@@ -3,7 +3,7 @@
 # (a `git archive` of it, with the repo's .venv) and refuses the deploy if it fails.
 #
 #   tests/run.sh     pytest tests/, bash -n on every *.sh, node --check on the dashboard JS,
-#                    py_compile on the agent and the backup scripts
+#                    py_compile on the agent, the backup scripts and tools/
 #
 # Runs every check, then exits non-zero if any failed. AVM_TEST_PYTHON picks the interpreter for pytest
 # (default: .venv/bin/python in the repo root). AVM_TEST_SKIP_PYTEST=1 runs only the static checks (what
@@ -42,7 +42,7 @@ if command -v node >/dev/null; then
 else
   echo "FAIL  node --check: node is not installed" >&2; failed+=("node --check")
 fi
-each "py_compile" "python3 -m py_compile" agent/*.py deploy/backup/*.py
+each "py_compile" "python3 -m py_compile" agent/*.py deploy/backup/*.py tools/*.py
 
 if ((${#failed[@]})); then
   echo "tests/run.sh: ${#failed[@]} check(s) FAILED: ${failed[*]}" >&2
