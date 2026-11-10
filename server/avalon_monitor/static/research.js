@@ -1,7 +1,7 @@
 // Research results pages: renders the latest document a project pushed with `avm results push`
 // (schema "<name>-results/<n>") and per-metric history across pushes. Everything is rendered as
 // text/SVG from the pushed document only - nothing is ever fetched from the project itself.
-import { $, h, fmt, state, api, post, guard, on, navigate, toast, canChange, roTip } from "./core.js?v=1.17.1";
+import { $, h, fmt, state, api, post, guard, on, navigate, toast, canChange, roTip } from "./core.js?v=1.17.2";
 
 const NS = "http://www.w3.org/2000/svg";
 function s(tag, attrs = {}, ...kids) {
@@ -544,9 +544,23 @@ export const nextVerdict = (current, clicked) => (current === clicked ? null : c
 
 /** The boxes drawn for an item: those scoring at/above the threshold, plus every reviewed box whatever its score
  *  (slider-independent: a verdict must never hide). vOf(file, id) -> "good" | "bad" | null. */
+// Boxes marked bad are hidden from the image (owner request 11-09: false detections crowded the photo out). They stay
+// in the full-size view's box list, where their ✓ / ✗ buttons can still clear or flip them; the "show boxes marked bad"
+// toggle brings them back on the image. A viewer preference, remembered per browser.
+let SHOW_BAD = false;
+try { SHOW_BAD = localStorage.getItem("avm.gallery.showBad") === "1"; } catch { /* storage blocked: default hidden */ }
+export const showBad = () => SHOW_BAD;
+export function setShowBad(on) {
+  SHOW_BAD = !!on;
+  try { localStorage.setItem("avm.gallery.showBad", SHOW_BAD ? "1" : "0"); } catch { /* not remembered: fine */ }
+}
+
 export function drawnBoxes(item, thr, vOf = noVerdict) {
-  return (Array.isArray(item?.boxes) ? item.boxes : [])
-    .filter((b) => (num(b?.score) != null && b.score >= thr) || (typeof b?.id === "string" && vOf(item.file, b.id) != null));
+  return (Array.isArray(item?.boxes) ? item.boxes : []).filter((b) => {
+    const v = typeof b?.id === "string" ? vOf(item.file, b.id) : null;
+    if (v === "bad" && !SHOW_BAD) return false;   // reviewed as a false detection: off the image (still in the box list)
+    return (num(b?.score) != null && b.score >= thr) || v != null;
+  });
 }
 
 /** A client point -> image pixel space, from the overlay's on-screen rect and its "xMidYMid meet" scale (the image
@@ -707,7 +721,9 @@ function galleryModal(ctx, list, start) {
         h("tbody", {}, boxes.map((b) => {
           const v = typeof b.id === "string" ? ctx.vOf(it.file, b.id) : null;
           const id = typeof b.id === "string" ? b.id : null;
-          return h("tr", { class: (num(b.score) != null && b.score >= thr) || v ? "" : "below",
+          const hiddenBad = v === "bad" && !showBad();   // off the image; the row stays so it can be cleared or flipped
+          return h("tr", { class: hiddenBad ? "below hidden-bad" : (num(b.score) != null && b.score >= thr) || v ? "" : "below",
+            title: hiddenBad ? "marked bad: hidden from the image (tick “show boxes marked bad” to see it)" : null,
             onmouseenter: id ? () => highlight(id, true) : null, onmouseleave: id ? () => highlight(id, false) : null },
             h("td", {}, h("i", { class: "lg-sw", style: `background:${ctx.colorOf(b.label)}` }), " ", b.label),
             h("td", { class: "r num" }, fScore(b.score)),
@@ -925,6 +941,8 @@ function gallerySection(project, sets) {
   const reviewSel = h("select", { title: "Review: per-box verdicts (boxes with an id) and boxes drawn by hand" }, opt("", "all (review)", true),
     opt("unreviewed", "has unreviewed boxes"), opt("bad", "has bad boxes"), opt("done", "fully reviewed"), opt("drawn", "has drawn boxes"));
   const thrVal = h("span", { class: "num gal-thr-val" }, "0.00");
+  const badChk = h("input", { type: "checkbox", class: "gal-bad", "aria-label": "show boxes marked bad" });
+  badChk.checked = showBad();
   const slider = h("input", { type: "range", min: "0", max: "1", step: "0.01", value: "0", class: "gal-thr", "aria-label": "score threshold" });
   const counts = h("div", { class: "gal-counts muted" });
   const reviewLine = h("div", { class: "gal-counts gal-review muted" });
@@ -1130,6 +1148,11 @@ function gallerySection(project, sets) {
   sessSel.addEventListener("change", () => { f.session = sessSel.value; if (index) refresh(); });
   keptSel.addEventListener("change", () => { f.kept = keptSel.value; if (index) refresh(); });
   reviewSel.addEventListener("change", () => { f.review = reviewSel.value; if (index) refresh(); });
+  badChk.addEventListener("change", () => {
+    setShowBad(badChk.checked);
+    if (index) refresh(true);
+    for (const fn of ctx.listeners) fn();   // an open full-size view redraws its overlay too
+  });
   slider.addEventListener("input", () => {
     f.thr = Number(slider.value) || 0; thrVal.textContent = f.thr.toFixed(2);
     cancelAnimationFrame(raf); raf = requestAnimationFrame(() => { if (index) refresh(true); });
@@ -1153,7 +1176,9 @@ function gallerySection(project, sets) {
   root.append(
     h("div", { class: "fig-head" }, h("h3", {}, "Gallery"), h("span", { class: "muted fig-cap" }, `${sets.length} image set${sets.length === 1 ? "" : "s"} · visible to signed-in dashboard viewers`)),
     h("div", { class: "gal-controls" }, setSel, kindSel, labelSel, sessSel, keptSel, reviewSel,
-      h("label", { class: "gal-thr-wrap", title: "Hide boxes scoring below this (reviewed boxes always show)" }, "score ≥", slider, thrVal), delBtn),
+      h("label", { class: "gal-thr-wrap", title: "Hide boxes scoring below this (reviewed boxes always show, except ones marked bad)" }, "score ≥", slider, thrVal),
+      h("label", { class: "gal-bad-wrap", title: "Boxes you marked bad are hidden from the image; they stay in the full-size view's box list" }, badChk, "show boxes marked bad"),
+      delBtn),
     meta, counts, reviewLine, grid, more, sentinel);
   loadSet();
   return root;

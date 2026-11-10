@@ -523,6 +523,8 @@ svg text.db-val { font-size: 11.5px; font-weight: 600; }
 .gal-controls select { max-width: 100%; }
 .gal-controls .danger { margin-left: auto; }
 .gal-thr-wrap { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--ink-2); }
+.gal-bad-wrap { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
+.gal-boxes tr.hidden-bad td:first-child { text-decoration: line-through; }
 .gal-thr { width: 140px; accent-color: var(--accent); }
 .gal-thr-val { min-width: 2.6em; color: var(--ink); }
 .gal-meta { margin: 0 0 6px; }

@@ -256,7 +256,7 @@ console.log(JSON.stringify({
     out = json.loads(subprocess.run(["node", "--input-type=module", "-e", js], capture_output=True, text=True, timeout=30, check=True).stdout)
     assert out == {
         "inner": "small", "outer": "big", "none": None, "noid": None, "onlyDrawn": "big",
-        "drawnHi": ["small"], "drawnNoV": 0,
+        "drawnHi": [], "drawnNoV": 0,   # "small" is reviewed bad: hidden from the image since 1.17.2 (see test_bad_boxes_hidden)
         "px": [50, 50], "pxOut": None,
         "t": ["good", None, "bad"],
         "counts": {"n": 3, "reviewed": 2, "good": 1, "bad": 1},
@@ -357,3 +357,34 @@ def test_ui_box_list_review_buttons():
     assert "onmouseenter: id ? () => highlight(id, true) : null" in src
     css = (STATIC / "app.css").read_text()
     assert "svg .gal-box.gal-hl" in css and ".gal-vbtn-good.active" in css and ".gal-vbtn-bad.active" in css
+
+
+@needs_node
+def test_bad_boxes_hidden():
+    """Gallery verdicts (owner request 11-09: false detections crowded the photo out): a box reviewed bad is off the
+    image by default, both drawn and hit-tested, whatever the threshold, while good and unreviewed boxes are as before;
+    "show boxes marked bad" (setShowBad) brings it back. Run in node."""
+    js = """
+import { drawnBoxes, hitBox, setShowBad, showBad, vKey } from %s;
+const bad = {id: "bad", label: "cup", score: 0.9, bbox: [40, 40, 20, 20]};
+const good = {id: "good", label: "cup", score: 0.1, bbox: [0, 0, 100, 100]};
+const plain = {id: "plain", label: "cup", score: 0.8, bbox: [70, 70, 10, 10]};
+const it = {file: "a", boxes: [bad, good, plain]};
+const V = new Map([[vKey("a", "bad"), "bad"], [vKey("a", "good"), "good"]]);
+const vOf = (f, id) => V.get(vKey(f, id)) ?? null;
+const ids = (thr) => drawnBoxes(it, thr, vOf).map((b) => b.id);
+const out = {defaultOff: showBad(), hidden: ids(0), hit: hitBox(drawnBoxes(it, 0, vOf), 50, 50)?.id};
+setShowBad(true);
+out.shown = ids(0); out.hitShown = hitBox(drawnBoxes(it, 0, vOf), 50, 50)?.id; out.on = showBad();
+setShowBad(false);
+out.again = ids(0);
+console.log(JSON.stringify(out));
+""" % json.dumps((STATIC / "research.js").as_uri())
+    out = json.loads(subprocess.run(["node", "--input-type=module", "-e", js], capture_output=True, text=True, timeout=30, check=True).stdout)
+    assert out["defaultOff"] is False
+    assert out["hidden"] == ["good", "plain"] and out["hit"] == "good"   # the click falls through to the box under it
+    assert out["shown"] == ["bad", "good", "plain"] and out["hitShown"] == "bad" and out["on"] is True
+    assert out["again"] == ["good", "plain"]
+    src = (STATIC / "research.js").read_text()
+    assert '"show boxes marked bad"' in src and "badChk.checked = showBad()" in src
+    assert 'hiddenBad ? "below hidden-bad"' in src   # the box list keeps the row, marked hidden
