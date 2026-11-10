@@ -61,3 +61,37 @@ def test_drawing_code_uses_the_options():
     assert "pointsLabel(fig)" in SRC and '"dots: test users"' not in SRC
     assert "const base = baseOf(fig)" in SRC and "Math.min(dom[1], base)" in SRC
     assert not re.search(r"Math\.min\(dom\[1\], 0\)\)\);", SRC)
+
+
+CI_JS = """
+import { ciLabel, customCi } from %(research)s;
+console.log(JSON.stringify({
+  plain: [ciLabel({}), customCi({})],
+  row: [ciLabel({ci_label: "seed min-max"}), customCi({ci_label: "seed min-max"})],
+  fig: [ciLabel({}, {ci_label: "seed range"}), customCi(null, {ci_label: "seed range"})],
+  rowWins: ciLabel({ci_label: "row"}, {ci_label: "fig"}),
+  blank: [ciLabel({ci_label: "   "}), ciLabel({ci_label: 5})],
+}));
+"""
+
+
+@needs_node
+def test_ci_label_option():
+    """Research options: ci_label (2026-11-09, tinyseek's student sweep). 3-seed min-max ranges were drawn and
+    tooltipped as "95% CI". A row's or figure's ci_label names the interval instead; the row's wins over the
+    figure's; blank or non-string values keep "95% CI"."""
+    out = subprocess.run(["node", "--input-type=module", "-e", CI_JS % {"research": json.dumps((STATIC / "research.js").as_uri())}],
+                         capture_output=True, text=True, timeout=30, check=True)
+    r = json.loads(out.stdout)
+    assert r["plain"] == ["95% CI", False]
+    assert r["row"] == ["seed min-max", True] and r["fig"] == ["seed range", True]
+    assert r["rowWins"] == "row" and r["blank"] == ["95% CI", "95% CI"]
+
+
+def test_no_hard_coded_ci_in_tooltips():
+    """Research options (static, source-text): every interval tooltip, legend and caption goes through ciLabel, so a
+    seed range is never called a 95% CI. The headline legend notes when some rows label their own interval."""
+    assert '"  95% CI " + fci' not in SRC and '"95% CI " + fcid' not in SRC and '" · 95% CI " + fcid' not in SRC
+    assert SRC.count("ciLabel(") >= 6
+    assert '"result · interval (95% CI unless noted)"' in SRC
+    assert "whiskers: ${ciLabel(null, fig)}" in SRC

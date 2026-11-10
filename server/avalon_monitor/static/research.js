@@ -1,7 +1,7 @@
 // Research results pages: renders the latest document a project pushed with `avm results push`
 // (schema "<name>-results/<n>") and per-metric history across pushes. Everything is rendered as
 // text/SVG from the pushed document only - nothing is ever fetched from the project itself.
-import { $, h, fmt, state, api, post, guard, on, navigate, toast, canChange, roTip } from "./core.js?v=1.17.0";
+import { $, h, fmt, state, api, post, guard, on, navigate, toast, canChange, roTip } from "./core.js?v=1.17.1";
 
 const NS = "http://www.w3.org/2000/svg";
 function s(tag, attrs = {}, ...kids) {
@@ -20,6 +20,11 @@ export const decOf = (fig) => (Number.isInteger(fig?.decimals) && fig.decimals >
 export const fvd = (v, d) => (d == null || num(v) == null ? fv(v) : v.toFixed(d));
 export const pointsLabel = (fig) => "dots: " + (typeof fig?.points_label === "string" && fig.points_label.trim() ? fig.points_label.trim() : "test users");
 export const baseOf = (fig) => (num(fig?.baseline) != null ? fig.baseline : 0);
+//   ci_label      headline rows, bars rows, dot-bar bars, or a whole figure: what the interval is, e.g. "seed min-max"
+//                 (3 seeds give a range, not a confidence interval); else "95% CI". The row's wins over the figure's.
+const labelStr = (v) => (typeof v === "string" && v.trim() ? v.trim().slice(0, 40) : null);
+export const ciLabel = (o, fig) => labelStr(o?.ci_label) || labelStr(fig?.ci_label) || "95% CI";
+export const customCi = (o, fig) => !!(labelStr(o?.ci_label) || labelStr(fig?.ci_label));
 const fci = (ci) => (Array.isArray(ci) && num(ci[0]) != null && num(ci[1]) != null ? `[${fv(ci[0])}, ${fv(ci[1])}]` : null);
 const clip = (t, n) => { t = String(t ?? ""); if (t.length <= n) return t; const a = Math.ceil((n - 1) / 2), b = Math.floor((n - 1) / 2); return t.slice(0, a) + "…" + (b ? t.slice(-b) : ""); };
 // Categorical order (validated against both surfaces); identity is always also carried by a text label.
@@ -88,7 +93,7 @@ function intervalPlot(row, width, scale) {
   }
   if (num(row.value) != null) g.append(s("circle", { cx: x(row.value), cy: H / 2, r: 5, class: "pt" }));
   tip(g, () => [
-    `${row.result || row.id}: ${fv(row.value)}${ci ? "  95% CI " + fci(ci) : "  (no interval recorded)"}`,
+    `${row.result || row.id}: ${fv(row.value)}${ci ? `  ${ciLabel(row)} ` + fci(ci) : "  (no interval recorded)"}`,
     num(row.chance) != null ? `chance ${fv(row.chance)}` : null,
     cmp ? `${cmp.label || "comparator"} ${fv(cmp.value)}` : null,
   ].filter(Boolean).join("\n"));
@@ -152,7 +157,8 @@ function headlineTable(doc, history, viewing) {
     tbody.append(h("tr", {},
       h("td", { class: "res" }, h("div", { class: "res-name" }, r.result || r.id), h("div", { class: "res-sub" }, [r.metric, r.compliance].filter(Boolean).join(" · "))),
       h("td", { class: "r num" }, r.n == null ? "—" : String(r.n)),
-      h("td", { class: "r num val" }, h("b", {}, fv(r.value)), h("div", { class: "res-sub" }, fci(r.ci) || "no CI"),
+      h("td", { class: "r num val" }, h("b", {}, fv(r.value)),
+        h("div", { class: "res-sub" }, fci(r.ci) ? fci(r.ci) + (customCi(r) ? " " + ciLabel(r) : "") : "no CI"),
         delta != null ? h("div", { class: "delta " + (delta > 0 ? "up" : "down") }, `${delta > 0 ? "▲ +" : "▼ "}${fv(delta)} vs previous`) : null),
       h("td", { class: "plot" }, intervalPlot(r, IW, scale)),
       h("td", { class: "r num muted" }, r.comparator && num(r.comparator.value) != null ? h("span", { title: r.comparator.label || "" }, fv(r.comparator.value)) : "—"),
@@ -160,7 +166,7 @@ function headlineTable(doc, history, viewing) {
     ));
   }
   const legend = h("div", { class: "viz-legend" },
-    h("span", {}, h("i", { class: "lg-pt" }), "result · 95% CI"),
+    h("span", {}, h("i", { class: "lg-pt" }), rows.some((r) => customCi(r)) ? "result · interval (95% CI unless noted)" : "result · 95% CI"),
     h("span", {}, h("i", { class: "lg-chance" }), "chance"),
     h("span", {}, h("i", { class: "lg-cmp" }), "comparator"));
   return h("div", { class: "card table-card research-headline" },
@@ -236,14 +242,15 @@ function barFigure(fig) {
       g.append(s("text", { x: W - 2, y: yc + 4, "text-anchor": "end", class: "val" }, fval(v)));
       const hit = s("rect", { x: 0, y: yc - RH / 2 - off, width: W, height: RH, fill: "transparent" });
       const extra = Object.entries(r).filter(([k, val]) => !["label", "value", "ci"].includes(k) && (typeof val === "number" || typeof val === "string")).map(([k, val]) => `${k} ${val}`);
-      tip(hit, [`${r.label}: ${fval(v)}`, fcid(r.ci) ? "95% CI " + fcid(r.ci) : null, ...extra].filter(Boolean).join("\n"));
+      tip(hit, [`${r.label}: ${fval(v)}`, fcid(r.ci) ? `${ciLabel(r, fig)} ` + fcid(r.ci) : null, ...extra].filter(Boolean).join("\n"));
       g.append(hit);
     });
     return g;
   };
   const better = fig.better === "lower" ? "lower is better" : fig.better === "higher" ? "higher is better" : null;
   return h("div", { class: "card table-card fig" },
-    h("div", { class: "fig-head" }, h("h3", {}, fig.title || fig.id), h("span", { class: "muted fig-cap" }, [fig.unit, better].filter(Boolean).join(" · ")),
+    h("div", { class: "fig-head" }, h("h3", {}, fig.title || fig.id),
+      h("span", { class: "muted fig-cap" }, [fig.unit, better, customCi(null, fig) ? `whiskers: ${ciLabel(null, fig)}` : null].filter(Boolean).join(" · ")),
       Array.isArray(fig.band) ? h("span", { class: "viz-legend" }, h("span", {}, h("i", { class: "lg-band" }), fig.band_label || "band")) : null),
     rows.length ? responsive(draw) : h("div", { class: "muted" }, "no rows"));
 }
@@ -432,7 +439,7 @@ function dotbarFigure(fig, colors) {
             class: "db-bar " + (hat ? "hatched" : "solid"), fill: hat ? `url(#${patFor(grp.color)})` : null }));
         }
         const hit = s("rect", { x: c - u / 2, y: top, width: u, height: plotH, fill: "transparent" });
-        tip(hit, [`${grp.label || ""} · ${vLabel(b)}${b.sublabel ? " (" + b.sublabel + ")" : ""}`, `value ${fval(v)}${ci ? " · 95% CI " + fcid(ci) : ""}`,
+        tip(hit, [`${grp.label || ""} · ${vLabel(b)}${b.sublabel ? " (" + b.sublabel + ")" : ""}`, `value ${fval(v)}${ci ? ` · ${ciLabel(b, fig)} ` + fcid(ci) : ""}`,
           pts.length ? `${pts.length} point${pts.length === 1 ? "" : "s"}` : null].filter(Boolean).join("\n"));
         fore.push(hit);
         if (ci) {
@@ -490,7 +497,8 @@ function dotbarFigure(fig, colors) {
   const anyPts = groups.some((g) => g.bars.some((b) => ptsOf(b).length)), anyCi = groups.some((g) => g.bars.some((b) => okCi(b.ci)));
   const legend = h("div", { class: "viz-legend" },
     used.map((k) => h("span", {}, swatch(isHatched({ variant: k })), variants.get(k)?.label || k || "value")),
-    anyPts || anyCi ? h("span", { class: "muted" }, [anyPts ? pointsLabel(fig) : null, anyCi ? "whiskers: 95% intervals" : null].filter(Boolean).join("; ")) : null);
+    anyPts || anyCi ? h("span", { class: "muted" }, [anyPts ? pointsLabel(fig) : null,
+      anyCi ? (customCi(null, fig) ? `whiskers: ${ciLabel(null, fig)}` : "whiskers: 95% intervals") : null].filter(Boolean).join("; ")) : null);
   const notes = (fig.notes || []).filter((n) => typeof n === "string" && n.trim());
   return h("div", { class: "card table-card fig" },
     h("div", { class: "fig-head" }, h("h3", {}, fig.title || fig.id), fig.unit ? h("span", { class: "muted fig-cap" }, fig.unit) : null),

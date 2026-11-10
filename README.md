@@ -139,7 +139,9 @@ JSON objects with `schema: "<name>-results/<n>"`, `project` equal to the URL slu
 `ci`, `points`, `point_labels`) with `variants`, `series_colors` and `reference_lines`. Optional per-figure
 display fields (hub 1.14.3+; older hubs ignore them): `decimals` (0-6, the precision of value labels;
 default 3), and for dot-bars `points_label` (what the dots are, shown in the legend; default "test users")
-and `baseline` (the value bars grow from, e.g. 0.5 for an AUC; default 0). Keep headline `id`s stable:
+and `baseline` (the value bars grow from, e.g. 0.5 for an AUC; default 0). `ci_label` (hub 1.17.1+; on a
+headline row, a bars row, a dot-bar bar or a whole figure) names what `ci` is when it isn't a 95% confidence
+interval, e.g. `"seed min-max"`: tooltips, legends and captions then say so instead of "95% CI". Keep headline `id`s stable:
 history is keyed on them. There's no dry run and a push can't be deleted, so check a document on a
 throwaway hub before pushing it. The hub renders only what is pushed and never reads the project
 itself, so a feed must carry aggregates only.
