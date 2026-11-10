@@ -176,7 +176,9 @@ meant; clicks outside every box behave as before (a tile opens the full-size vie
 smaller one has no clickable spot, so the full-size view's box list also has **✓ good / ✗ bad buttons on every row**
 (hovering a row highlights its box on the image). Good boxes are green with ✓, bad
 ones red with ✗, and reviewed boxes are always drawn whatever the score slider says, except that boxes marked
-bad are hidden from the image (they stay in the box list; tick "show boxes marked bad" to see them). The set shows
+bad are hidden from the image (they stay in the box list; tick "show boxes marked bad" to see them). **Ctrl+Z**
+(Cmd+Z) undoes the newest review mark of the set, step by step (up to 200; the history resets when the set
+changes). The set shows
 "reviewed N / M boxes (good g, bad b)" and a review filter (has unreviewed boxes / has bad boxes / fully reviewed).
 Viewers who can't change things see the verdicts but can't set them. The API:
 `GET /api/v1/projects/<p>/galleries/<slug>/verdicts` (signed-in viewers) and

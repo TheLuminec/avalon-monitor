@@ -1,7 +1,7 @@
 // Research results pages: renders the latest document a project pushed with `avm results push`
 // (schema "<name>-results/<n>") and per-metric history across pushes. Everything is rendered as
 // text/SVG from the pushed document only - nothing is ever fetched from the project itself.
-import { $, h, fmt, state, api, post, guard, on, navigate, toast, canChange, roTip } from "./core.js?v=1.17.2";
+import { $, h, fmt, state, api, post, guard, on, navigate, toast, canChange, roTip } from "./core.js?v=1.17.3";
 
 const NS = "http://www.w3.org/2000/svg";
 function s(tag, attrs = {}, ...kids) {
@@ -555,6 +555,23 @@ export function setShowBad(on) {
   try { localStorage.setItem("avm.gallery.showBad", SHOW_BAD ? "1" : "0"); } catch { /* not remembered: fine */ }
 }
 
+// Undo for review marks (Ctrl+Z / Cmd+Z, owner request 11-10: bring back a box discarded by mistake). Each mark the
+// operator makes records {slug, file, id, prev}; undo restores prev. Per set, newest last, capped.
+export const UNDO_CAP = 200;
+export function pushUndo(stack, entry, cap = UNDO_CAP) {
+  stack.push(entry);
+  if (stack.length > cap) stack.splice(0, stack.length - cap);
+  return stack;
+}
+/** The newest entry for this set, removed from the stack (null if none). Entries of other sets are dropped. */
+export function popUndo(stack, slug) {
+  while (stack.length) {
+    const e = stack.pop();
+    if (e && e.slug === slug) return e;
+  }
+  return null;
+}
+
 export function drawnBoxes(item, thr, vOf = noVerdict) {
   return (Array.isArray(item?.boxes) ? item.boxes : []).filter((b) => {
     const v = typeof b?.id === "string" ? vOf(item.file, b.id) : null;
@@ -738,7 +755,7 @@ function galleryModal(ctx, list, start) {
           addedCell(it, a)))))
         : h("div", { class: "muted" }, "no boxes"),
       r.n ? h("div", { class: "muted gal-hint" }, canChange()
-        ? "Click inside a box: good · right-click: bad · the same click again clears it. Boxes hidden under others: use the ✓ / ✗ buttons in this list."
+        ? "Click inside a box: good · right-click: bad · the same click again clears it · Ctrl+Z undoes the last mark. Boxes hidden under others: use the ✓ / ✗ buttons in this list."
         : "Sign in to review boxes.") : null,
       canChange() ? h("div", { class: "muted gal-hint" }, "Missed an object? Draw box (D), then drag on the image; pick its label and Save (Enter) or Cancel (Esc).") : null);
   }
@@ -923,6 +940,7 @@ function gallerySection(project, sets) {
   const f = { kind: "", slug: sets[0].slug, label: "", session: "", kept: "", review: "", thr: 0, vOf, addedOf };
   let index = null, colors = new Map(), shown = [], tiles = new Map(), upto = 0, raf = 0, loadSeq = 0, labelOpts = [""], byFile = new Map();
   const pending = new Map();   // vKey -> sequence number of the PUT in flight for it (a newer click wins)
+  const undo = [];             // this set's review marks, newest last (Ctrl+Z / Cmd+Z restores the previous verdict)
   let vSeq = 0;
   const colorOf = (lab) => {
     if (!colors.has(lab)) colors.set(lab, `var(${SERIES[colors.size % SERIES.length]})`);
@@ -980,8 +998,10 @@ function gallerySection(project, sets) {
     updateReview();
     for (const fn of ctx.listeners) fn();
   }
-  function setVerdict(it, id, verdict) {
+  // record: an operator's own mark (click or row button) goes on the undo stack; an undo itself doesn't
+  function setVerdict(it, id, verdict, record = true) {
     const k = vKey(it.file, id), prev = verdicts.get(k) || null, mine = ++vSeq, slug = f.slug;
+    if (record && (prev?.verdict ?? null) !== (verdict ?? null)) pushUndo(undo, { slug, it, id, prev: prev?.verdict ?? null, next: verdict ?? null });
     pending.set(k, mine);
     apply(it, id, verdict ? { verdict, at: Date.now() / 1000, by: state.config?.user?.subject ?? null } : null);
     post(`/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(slug)}/verdicts`, { file: it.file, box_id: id, verdict }, "PUT")
@@ -1105,6 +1125,7 @@ function gallerySection(project, sets) {
   async function loadSet() {
     const seq = ++loadSeq;
     index = null;
+    undo.length = 0;   // undo history is per set
     grid.replaceChildren(h("div", { class: "muted gal-none" }, "Loading…"));
     const base = `/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(f.slug)}`;
     let doc, vs, ad;
@@ -1164,6 +1185,20 @@ function gallerySection(project, sets) {
     try { await post(`/api/v1/projects/${encodeURIComponent(project)}/galleries/${encodeURIComponent(m.slug)}`, undefined, "DELETE"); toast(`Deleted ${m.set}`); renderResearch({ project }); }
     catch (e) { toast(e.message, true); }
   });
+  // Ctrl+Z / Cmd+Z: undo the newest review mark of this set (works in the grid and in the full-size view; not while
+  // typing in a field such as the drawn-box label editor; operators only, as marks are)
+  const onUndoKey = (e) => {
+    if (!root.isConnected) { document.removeEventListener("keydown", onUndoKey); return; }   // the page was left
+    if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || (e.key || "").toLowerCase() !== "z") return;
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target?.tagName || "") || !canChange() || !index) return;
+    e.preventDefault();
+    const u = popUndo(undo, f.slug);
+    if (!u) { toast("Nothing to undo"); return; }
+    setVerdict(u.it, u.id, u.prev, false);
+    const lab = (u.it.boxes || []).find((b) => b?.id === u.id)?.label || "box";
+    toast(`Undone: ${lab} ${u.next ? VERDICT_MARK[u.next] + " " + u.next : "cleared"} → ${u.prev ? VERDICT_MARK[u.prev] + " " + u.prev : "unreviewed"}`);
+  };
+  document.addEventListener("keydown", onUndoKey);
   if ("IntersectionObserver" in window) {
     const io = new IntersectionObserver((es) => {
       if (!sentinel.isConnected) { io.disconnect(); return; }   // the page was left

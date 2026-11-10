@@ -388,3 +388,31 @@ console.log(JSON.stringify(out));
     src = (STATIC / "research.js").read_text()
     assert '"show boxes marked bad"' in src and "badChk.checked = showBad()" in src
     assert 'hiddenBad ? "below hidden-bad"' in src   # the box list keeps the row, marked hidden
+
+
+@needs_node
+def test_undo_review_marks():
+    """Gallery verdicts (owner request 11-10: Ctrl+Z brings back a box discarded by mistake). pushUndo / popUndo keep
+    a capped, per-set history, newest first out. The page records every operator mark (not undos themselves, not
+    no-op marks), clears the history when the set changes, and binds Ctrl+Z / Cmd+Z (not while typing, operators
+    only) to restore the previous verdict. Helpers run in node; the wiring is checked in the source."""
+    js = """
+import { pushUndo, popUndo } from %s;
+const s = [];
+pushUndo(s, {slug: "a", id: 1}); pushUndo(s, {slug: "a", id: 2}); pushUndo(s, {slug: "b", id: 3});
+const out = {first: popUndo(s, "b")?.id, second: popUndo(s, "a")?.id, third: popUndo(s, "a")?.id, empty: popUndo(s, "a")};
+const c = []; for (let i = 0; i < 5; i++) pushUndo(c, {slug: "a", id: i}, 3);
+out.capped = c.map((e) => e.id);
+const m = [{slug: "old", id: 9}, {slug: "a", id: 1}, {slug: "old", id: 8}];
+out.skipsOther = popUndo(m, "a")?.id; out.left = m.length;
+console.log(JSON.stringify(out));
+""" % json.dumps((STATIC / "research.js").as_uri())
+    out = json.loads(subprocess.run(["node", "--input-type=module", "-e", js], capture_output=True, text=True, timeout=30, check=True).stdout)
+    assert out == {"first": 3, "second": 2, "third": 1, "empty": None, "capped": [2, 3, 4], "skipsOther": 1, "left": 1}
+    src = (STATIC / "research.js").read_text()
+    assert "function setVerdict(it, id, verdict, record = true)" in src
+    assert "if (record && (prev?.verdict ?? null) !== (verdict ?? null)) pushUndo(undo," in src
+    assert "setVerdict(u.it, u.id, u.prev, false)" in src                   # an undo is not itself recorded
+    assert "undo.length = 0;   // undo history is per set" in src
+    key = src[src.index("const onUndoKey"):src.index('document.addEventListener("keydown", onUndoKey)')]
+    assert "(e.ctrlKey || e.metaKey)" in key and '"z"' in key and "INPUT|TEXTAREA|SELECT" in key and "!canChange()" in key
